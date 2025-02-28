@@ -73,8 +73,6 @@ func httpClient(user string) *http.Client {
 func NewState(ctx context.Context) *State {
 	var s State
 	s.circuits = circuits
-	// s.dst = destination
-	// s.fname = name
 	s.output = ""
 	s.minLifetime = time.Duration(minLifetime) * time.Second
 	s.verbose = verbose
@@ -370,7 +368,7 @@ func (s *State) Fetch(src string) int {
 	getOutputFilepath(s)
 	fmt.Println("Output file:", s.output)
 
-	// get the target length
+	// Get the target length
 	client := httpClient("torget")
 	resp, err := client.Head(s.src)
 	if err != nil {
@@ -384,7 +382,7 @@ func (s *State) Fetch(src string) int {
 	s.bytesTotal = resp.ContentLength
 	fmt.Println("Download length:", s.bytesTotal, "bytes")
 
-	// create the output file
+	// Create the output file. This will overwrite an existing file
 	file, err := os.Create(s.output)
 	if file != nil {
 		file.Close()
@@ -394,7 +392,7 @@ func (s *State) Fetch(src string) int {
 		return 1
 	}
 
-	// initialize chunks
+	// Initialize chunks
 	chunkLen := s.bytesTotal / int64(s.circuits)
 	seq := 0
 	for id := 0; id < s.circuits; id++ {
@@ -405,7 +403,7 @@ func (s *State) Fetch(src string) int {
 	}
 	s.chunks[s.circuits-1].length += s.bytesTotal % int64(s.circuits)
 
-	// spawn initial fetchers
+	// Spawn initial fetchers
 	go s.progress()
 	go func() {
 		for id := 0; id < s.circuits; id++ {
@@ -415,15 +413,16 @@ func (s *State) Fetch(src string) int {
 		}
 	}()
 
-	// spawn additional fetchers as needed
+	// Spawn additional fetchers as needed
 	for {
 		select {
 		case id := <-s.done:
-			if s.chunks[id].length > 0 { // error
-				// resume in a new and hopefully faster circuit
+			if s.chunks[id].length > 0 {
+				// Error. Resume in a new and hopefully faster circuit
 				s.chunks[id].circuit = seq
 				seq++
-			} else { // completed
+			} else {
+				// Completed
 				longest := 0
 				s.rwmutex.RLock()
 				for i := 1; i < s.circuits; i++ {
@@ -432,14 +431,18 @@ func (s *State) Fetch(src string) int {
 					}
 				}
 				s.rwmutex.RUnlock()
-				if s.chunks[longest].length == 0 { // all done
+
+				if s.chunks[longest].length == 0 {
+					// All done
 					s.printPermanent("Download complete")
 					return 0
 				}
-				if s.chunks[longest].length <= 5*torBlock { // too short to split
+				if s.chunks[longest].length <= 5*torBlock {
+					// Too short to split
 					continue
 				}
-				// this circuit is faster, so we split 80%/20%
+
+				// This circuit is faster, so we split 80%/20%
 				s.rwmutex.Lock()
 				s.chunks[id].length = s.chunks[longest].length * 4 / 5
 				s.chunks[longest].length -= s.chunks[id].length

@@ -50,8 +50,8 @@ Onion services are fully supported.
     Download complete
 
 ### Specify a new name for the file
-    $ ./torget -name "haiku-beta1-x86.iso" "https://mirrors.rit.edu/haiku/r1beta5/haiku-r1beta5-x86_gcc2h-anyboot.iso"
-    Output file: haiku-beta1-x86.iso
+    $ ./torget -name "haiku-beta5-x86.iso" "https://mirrors.rit.edu/haiku/r1beta5/haiku-r1beta5-x86_gcc2h-anyboot.iso"
+    Output file: haiku-beta5-x86.iso
     Download length: 1477246976 bytes
     Download complete
 

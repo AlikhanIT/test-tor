@@ -35,9 +35,9 @@ Onion services are fully supported.
             diagnostic details
 
 ### Download a file to the current directory
-    $ ./torget https://download.tails.net/tails/stable/tails-amd64-5.16.1/tails-amd64-5.16.1.img
-    Output file: tails-amd64-5.16.1.img
-    Download length: 1326448640 bytes
+    $ ./torget "https://archive.org/download/grimaces-birthday-game/Grimace%27s%20Birthday%20%28World%29%20%28v1.7%29%20%28Aftermarket%29%20%28Unl%29.gbc"
+    Output file: Grimace's Birthday (World) (v1.7) (Aftermarket) (Unl).gbc
+    Download length: 1048576 bytes
     Download complete
 
 ### Specify a new name for the file

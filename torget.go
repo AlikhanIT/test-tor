@@ -313,8 +313,10 @@ func (s *State) Fetch(src string) int {
 	s.src = src
 
 	// setup file name
-	if _, err := os.Stat(filepath.Dir(s.dst)); os.IsExist(err) {
-		fmt.Printf("WARNING: Unable to find output destination \"%s\".", filepath.Dir(s.dst))
+	if _, err := os.Stat(filepath.Dir(s.dst)); os.IsExist(err) || s.dst == "" {
+		if s.dst != "" {
+			fmt.Printf("WARNING: Unable to find output destination \"%s\".\n", filepath.Dir(s.dst))
+		}
 
 		srcUrl, err := url.Parse(src)
 		if err != nil {
@@ -330,6 +332,14 @@ func (s *State) Fetch(src string) int {
 		}
 		if s.dst == "" {
 			s.dst = "index"
+		}
+
+		// Remove URL formatting (e.g. "%20" -> " ", "%C3" -> "ö")
+		decoded, err := url.QueryUnescape(s.dst)
+		if err != nil {
+			fmt.Printf("WARNING: Cannot decode \"%s\" - %v\n", s.dst, err)
+		} else {
+			s.dst = decoded
 		}
 	}
 	fmt.Println("Output file:", s.dst)

@@ -27,9 +27,13 @@ Onion services are fully supported.
     -circuits, -c int
           Concurrent circuits. (default 20)
     -destination, -d string
-          Output filepath. Parent folder must already exist.
+          Output directory. (default current directory)
+    -force bool
+          Will create parent folder(s) and/or overwrite existing files.
     -min-lifetime, -l int
           Minimum circuit lifetime (seconds). (default 10)
+    -name, -n string
+          Output filename. (default filename from URL)
     -verbose, -v
           Show diagnostic details.
 
@@ -39,14 +43,32 @@ Onion services are fully supported.
     Download length: 1048576 bytes
     Download complete
 
+### Specify a destination directory
+    $ ./torget -destination "/isos" "https://cdimage.ubuntu.com/kubuntu/releases/24.10/release/kubuntu-24.10-desktop-amd64.iso"
+    Output file: /isos/kubuntu-24.10-desktop-amd64.iso
+    Download length: 4678961152 bytes
+    Download complete
+
 ### Specify a new name for the file
-    $ ./torget -destination "haiku-beta1-32bit.iso" "https://mirrors.rit.edu/haiku/r1beta5/haiku-r1beta5-x86_gcc2h-anyboot.iso"
-    Output file: haiku-beta1-32bit.iso
+    $ ./torget -name "haiku-beta1-x86.iso" "https://mirrors.rit.edu/haiku/r1beta5/haiku-r1beta5-x86_gcc2h-anyboot.iso"
+    Output file: haiku-beta1-x86.iso
     Download length: 1477246976 bytes
     Download complete
 
-### You can also specify a full filepath
-    $ ./torget -destination "/isos/kubuntu-24.10.iso" "https://cdimage.ubuntu.com/kubuntu/releases/24.10/release/kubuntu-24.10-desktop-amd64.iso"
-    Output file: /isos/kubuntu-24.10.iso
-    Download length: 4678961152 bytes
+### The -force flag
+Use the -force flag to create parent directories and/or overwrite existing files
+
+    $ ./torget -force -destination "/movies/Big Buck Bunny - Sunflower version (2013)" -name "Big Buck Bunny - Sunflower Version (2013).mp4" "http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_native_60fps_normal.mp4"
+    Output file: /movies/Big Buck Bunny - Sunflower version (2013)/Big Buck Bunny - Sunflower Version (2013).mp4
+    Download length: 831871244 bytes
     Download complete
+
+If the destination directory is not found, the program will try downloading to the current directory instead.
+
+    WARNING: Unable to find destination "/movies/Big Buck Bunny - Sunflower version (2013)".
+    Trying current directory instead.
+
+If the file already exists, you will receive an error.
+
+    ERROR: "/movies/Big Buck Bunny - Sunflower version (2013)/Big Buck Bunny - Sunflower Version (2013).mp4" already exists.
+    exit status 1

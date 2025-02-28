@@ -19,9 +19,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -42,9 +44,11 @@ type chunk struct {
 }
 
 type State struct {
-	ctx         context.Context
-	src         string
-	dst         string
+	ctx context.Context
+	src string
+	//dst         string
+	//fname       string
+	output      string
 	bytesTotal  int64
 	bytesPrev   int64
 	circuits    int
@@ -66,10 +70,12 @@ func httpClient(user string) *http.Client {
 	}
 }
 
-func NewState(ctx context.Context) *State { //, circuits int, destination string, minLifetime int, verbose bool) *State {
+func NewState(ctx context.Context) *State {
 	var s State
 	s.circuits = circuits
-	s.dst = destination
+	// s.dst = destination
+	// s.fname = name
+	s.output = ""
 	s.minLifetime = time.Duration(minLifetime) * time.Second
 	s.verbose = verbose
 	s.chunks = make([]chunk, s.circuits)
@@ -135,7 +141,7 @@ func (s *State) chunkFetch(id int, client *http.Client, req *http.Request) {
 	}
 
 	// open the output file
-	file, err := os.OpenFile(s.dst, os.O_WRONLY, 0)
+	file, err := os.OpenFile(s.output, os.O_WRONLY, 0)
 	defer file.Close()
 	if err != nil {
 		s.log <- fmt.Sprintf("os OpenFile: %s", err.Error())
@@ -279,7 +285,7 @@ func (s *State) progress() {
 	}
 }
 
-// kill the worst performing circuit
+// Kill the worst performing circuit
 func (s *State) darwin() {
 	victim := -1
 	var slowest float64
@@ -310,40 +316,59 @@ func (s *State) darwin() {
 	s.rwmutex.RUnlock()
 }
 
-func (s *State) Fetch(src string) int {
-	s.src = src
+func getOutputFilepath(s *State) {
+	_, err := os.Stat(destination)
 
-	// setup file name
-	if _, err := os.Stat(filepath.Dir(s.dst)); os.IsExist(err) || s.dst == "" {
-		if s.dst != "" {
-			fmt.Printf("WARNING: Unable to find output destination \"%s\".\n", filepath.Dir(s.dst))
+	if errors.Is(err, fs.ErrNotExist) {
+		if force {
+			os.MkdirAll(destination, os.ModePerm)
+		} else {
+			fmt.Printf("WARNING: Unable to find destination \"%s\".\nTrying current directory instead.\n", destination)
+			destination = ""
 		}
+	}
 
-		srcUrl, err := url.Parse(src)
+	// If no -name argument provided, extract the filename from the URL
+	if name == "" {
+		srcUrl, err := url.Parse(s.src)
 		if err != nil {
 			fmt.Println(err.Error())
-			return 1
+			os.Exit(1)
 		}
 		path := srcUrl.EscapedPath()
 		slash := strings.LastIndex(path, "/")
 		if slash >= 0 {
-			s.dst = path[slash+1:]
+			name = path[slash+1:]
 		} else {
-			s.dst = path
+			name = path
 		}
-		if s.dst == "" {
-			s.dst = "index"
+		if name == "" {
+			name = "index"
 		}
 
 		// Remove URL formatting (e.g. "%20" -> " ", "%C3" -> "ö")
-		decoded, err := url.QueryUnescape(s.dst)
+		decoded, err := url.QueryUnescape(name)
 		if err != nil {
-			fmt.Printf("WARNING: Cannot decode \"%s\" - %v\n", s.dst, err)
+			fmt.Printf("WARNING: Cannot decode \"%s\" - %v\n", name, err)
 		} else {
-			s.dst = decoded
+			name = decoded
 		}
 	}
-	fmt.Println("Output file:", s.dst)
+
+	s.output = filepath.Join(destination, name)
+
+	// If the file already exists and the -force argument was not used, exit
+	if _, err := os.Stat(s.output); err == nil && !force {
+		fmt.Printf("ERROR: \"%s\" already exists.\n", s.output)
+		os.Exit(1)
+	}
+}
+
+func (s *State) Fetch(src string) int {
+	s.src = src
+
+	getOutputFilepath(s)
+	fmt.Println("Output file:", s.output)
 
 	// get the target length
 	client := httpClient("torget")
@@ -360,7 +385,7 @@ func (s *State) Fetch(src string) int {
 	fmt.Println("Download length:", s.bytesTotal, "bytes")
 
 	// create the output file
-	file, err := os.Create(s.dst)
+	file, err := os.Create(s.output)
 	if file != nil {
 		file.Close()
 	}
@@ -433,23 +458,27 @@ var circuits int
 var destination string
 var force bool
 var minLifetime int
+var name string
 var verbose bool
 
 func init() {
-	flag.IntVar(&circuits, "circuits", 20, "concurrent circuits")
-	flag.IntVar(&circuits, "c", 20, "concurrent circuits")
+	flag.IntVar(&circuits, "circuits", 20, "Concurrent circuits.")
+	flag.IntVar(&circuits, "c", 20, "Concurrent circuits.")
 
-	flag.StringVar(&destination, "destination", "", "Output filepath. Parent folder must already exist.")
-	flag.StringVar(&destination, "d", "", "Output filepath. Parent folder must already exist.")
+	flag.StringVar(&destination, "destination", "", "Output directory.")
+	flag.StringVar(&destination, "d", "", "Output directory.")
 
 	// No short version of force since it is a dangerous flag. Easy to mistake "-f" as "-filename" or something
 	flag.BoolVar(&force, "force", false, "Will create parent folder(s) and/or overwrite existing files.")
 
-	flag.IntVar(&minLifetime, "min-lifetime", 10, "minimum circuit lifetime (seconds)")
-	flag.IntVar(&minLifetime, "l", 10, "minimum circuit lifetime (seconds)")
+	flag.IntVar(&minLifetime, "min-lifetime", 10, "Minimum circuit lifetime. (seconds)")
+	flag.IntVar(&minLifetime, "l", 10, "Minimum circuit lifetime. (seconds)")
 
-	flag.BoolVar(&verbose, "verbose", false, "diagnostic details")
-	flag.BoolVar(&verbose, "v", false, "diagnostic details")
+	flag.StringVar(&name, "name", "", "Output filename.")
+	flag.StringVar(&name, "n", "", "Output filename.")
+
+	flag.BoolVar(&verbose, "verbose", false, "Show iagnostic details.")
+	flag.BoolVar(&verbose, "v", false, "Show iagnostic details.")
 
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "torget 2.0, a fast large file downloader over locally installed Tor")
@@ -462,13 +491,15 @@ func init() {
 		fmt.Fprintln(os.Stderr, "  -circuits, -c int")
 		fmt.Fprintln(os.Stderr, "        Concurrent circuits. (default 20)")
 		fmt.Fprintln(os.Stderr, "  -destination, -d string")
-		fmt.Fprintln(os.Stderr, "        Output filepath. Parent folder must already exist.")
+		fmt.Fprintln(os.Stderr, "        Output directory. (default current directory)")
+		fmt.Fprintln(os.Stderr, "  -force bool")
+		fmt.Fprintln(os.Stderr, "        Will create parent folder(s) and/or overwrite existing files.")
 		fmt.Fprintln(os.Stderr, "  -min-lifetime, -l int")
 		fmt.Fprintln(os.Stderr, "        Minimum circuit lifetime (seconds). (default 10)")
+		fmt.Fprintln(os.Stderr, "  -name, -n string")
+		fmt.Fprintln(os.Stderr, "        Output filename. (default filename from URL)")
 		fmt.Fprintln(os.Stderr, "  -verbose, -v")
 		fmt.Fprintln(os.Stderr, "        Show diagnostic details.")
-
-		//flag.PrintDefaults()
 	}
 }
 
@@ -479,10 +510,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	uri := flag.Arg(0)
+	_, err := url.ParseRequestURI(uri)
+	if err != nil {
+		fmt.Printf("ERROR: \"%s\" is not a valid URL.\n", uri)
+		os.Exit(1)
+	}
+
 	ctx := context.Background()
-	state := NewState(ctx) //, circuits, destination, minLifetime, verbose)
+	state := NewState(ctx)
 	context.Background()
-	os.Exit(state.Fetch(flag.Arg(0)))
+	os.Exit(state.Fetch(uri))
 }
 
 // vim: noet:ts=4:sw=4:sts=4:spell

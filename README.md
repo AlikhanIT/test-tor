@@ -24,15 +24,14 @@ Onion services are fully supported.
     Licensed under GNU/GPL version 3
 
     Usage: torget [FLAGS] URL
-      Usage: torget [FLAGS] URL
-      -circuits int
-            concurrent circuits (default 20)
-      -destination string
-            Output filepath. Parent folder must already exist.
-      -min-lifetime int
-            minimum circuit lifetime (seconds) (default 10)
-      -verbose
-            diagnostic details
+    -circuits, -c int
+          Concurrent circuits. (default 20)
+    -destination, -d string
+          Output filepath. Parent folder must already exist.
+    -min-lifetime, -l int
+          Minimum circuit lifetime (seconds). (default 10)
+    -verbose, -v
+          Show diagnostic details.
 
 ### Download a file to the current directory
     $ ./torget "https://archive.org/download/grimaces-birthday-game/Grimace%27s%20Birthday%20%28World%29%20%28v1.7%29%20%28Aftermarket%29%20%28Unl%29.gbc"

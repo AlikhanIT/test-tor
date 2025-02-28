@@ -428,11 +428,23 @@ func (s *State) Fetch(src string) int {
 	}
 }
 
-func main() {
-	circuits := flag.Int("circuits", 20, "concurrent circuits")
-	destination := flag.String("destination", "", "Output filepath. Parent folder must already exist.")
-	minLifetime := flag.Int("min-lifetime", 10, "minimum circuit lifetime (seconds)")
-	verbose := flag.Bool("verbose", false, "diagnostic details")
+var circuits int
+var destination string
+var minLifetime int
+var verbose bool
+
+func init() {
+	flag.IntVar(&circuits, "circuits", 20, "concurrent circuits")
+	flag.IntVar(&circuits, "c", 20, "concurrent circuits")
+
+	flag.StringVar(&destination, "destination", "", "Output filepath. Parent folder must already exist.")
+	flag.StringVar(&destination, "d", "", "Output filepath. Parent folder must already exist.")
+
+	flag.IntVar(&minLifetime, "min-lifetime", 10, "minimum circuit lifetime (seconds)")
+	flag.IntVar(&minLifetime, "l", 10, "minimum circuit lifetime (seconds)")
+
+	flag.BoolVar(&verbose, "verbose", false, "diagnostic details")
+	flag.BoolVar(&verbose, "v", false, "diagnostic details")
 
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "torget 2.0, a fast large file downloader over locally installed Tor")
@@ -440,15 +452,30 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Licensed under GNU/GPL version 3")
 		fmt.Fprintln(os.Stderr)
 		fmt.Fprintln(os.Stderr, "Usage: torget [FLAGS] URL")
-		flag.PrintDefaults()
+
+		// Custom print out of the arguments to avoid duplicate entries for long and short versions
+		fmt.Fprintln(os.Stderr, "  -circuits, -c int")
+		fmt.Fprintln(os.Stderr, "        Concurrent circuits. (default 20)")
+		fmt.Fprintln(os.Stderr, "  -destination, -d string")
+		fmt.Fprintln(os.Stderr, "        Output filepath. Parent folder must already exist.")
+		fmt.Fprintln(os.Stderr, "  -min-lifetime, -l int")
+		fmt.Fprintln(os.Stderr, "        Minimum circuit lifetime (seconds). (default 10)")
+		fmt.Fprintln(os.Stderr, "  -verbose, -v")
+		fmt.Fprintln(os.Stderr, "        Show diagnostic details.")
+
+		//flag.PrintDefaults()
 	}
+}
+
+func main() {
 	flag.Parse()
 	if flag.NArg() != 1 {
 		flag.Usage()
 		os.Exit(1)
 	}
+
 	ctx := context.Background()
-	state := NewState(ctx, *circuits, *destination, *minLifetime, *verbose)
+	state := NewState(ctx, circuits, destination, minLifetime, verbose)
 	context.Background()
 	os.Exit(state.Fetch(flag.Arg(0)))
 }

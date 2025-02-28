@@ -66,7 +66,7 @@ func httpClient(user string) *http.Client {
 	}
 }
 
-func NewState(ctx context.Context, circuits int, destination string, minLifetime int, verbose bool) *State {
+func NewState(ctx context.Context) *State { //, circuits int, destination string, minLifetime int, verbose bool) *State {
 	var s State
 	s.circuits = circuits
 	s.dst = destination
@@ -279,7 +279,8 @@ func (s *State) progress() {
 	}
 }
 
-func (s *State) darwin() { // kill the worst performing circuit
+// kill the worst performing circuit
+func (s *State) darwin() {
 	victim := -1
 	var slowest float64
 	now := time.Now()
@@ -430,6 +431,7 @@ func (s *State) Fetch(src string) int {
 
 var circuits int
 var destination string
+var force bool
 var minLifetime int
 var verbose bool
 
@@ -439,6 +441,9 @@ func init() {
 
 	flag.StringVar(&destination, "destination", "", "Output filepath. Parent folder must already exist.")
 	flag.StringVar(&destination, "d", "", "Output filepath. Parent folder must already exist.")
+
+	// No short version of force since it is a dangerous flag. Easy to mistake "-f" as "-filename" or something
+	flag.BoolVar(&force, "force", false, "Will create parent folder(s) and/or overwrite existing files.")
 
 	flag.IntVar(&minLifetime, "min-lifetime", 10, "minimum circuit lifetime (seconds)")
 	flag.IntVar(&minLifetime, "l", 10, "minimum circuit lifetime (seconds)")
@@ -475,7 +480,7 @@ func main() {
 	}
 
 	ctx := context.Background()
-	state := NewState(ctx, circuits, destination, minLifetime, verbose)
+	state := NewState(ctx) //, circuits, destination, minLifetime, verbose)
 	context.Background()
 	os.Exit(state.Fetch(flag.Arg(0)))
 }

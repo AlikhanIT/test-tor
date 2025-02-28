@@ -44,10 +44,8 @@ type chunk struct {
 }
 
 type State struct {
-	ctx context.Context
-	src string
-	//dst         string
-	//fname       string
+	ctx         context.Context
+	src         string
 	output      string
 	bytesTotal  int64
 	bytesPrev   int64
@@ -314,7 +312,7 @@ func (s *State) darwin() {
 	s.rwmutex.RUnlock()
 }
 
-func getOutputFilepath(s *State) {
+func (s *State) getOutputFilepath() {
 	_, err := os.Stat(destination)
 
 	if errors.Is(err, fs.ErrNotExist) {
@@ -327,12 +325,12 @@ func getOutputFilepath(s *State) {
 	}
 
 	// If no -name argument provided, extract the filename from the URL
-	if name == "" {
-		srcUrl, err := url.Parse(s.src)
-		if err != nil {
-			fmt.Println(err.Error())
-			os.Exit(1)
-		}
+	if name == "" || flag.NArg() > 1 {
+		srcUrl, _ := url.Parse(s.src) // We've already parsed the URL, ignore errors here
+		// if err != nil {
+		// 	fmt.Println(err.Error())
+		// 	return 1
+		// }
 		path := srcUrl.EscapedPath()
 		slash := strings.LastIndex(path, "/")
 		if slash >= 0 {
@@ -354,18 +352,17 @@ func getOutputFilepath(s *State) {
 	}
 
 	s.output = filepath.Join(destination, name)
-
-	// If the file already exists and the -force argument was not used, exit
-	if _, err := os.Stat(s.output); err == nil && !force {
-		fmt.Printf("ERROR: \"%s\" already exists.\n", s.output)
-		os.Exit(1)
-	}
 }
 
 func (s *State) Fetch(src string) int {
 	s.src = src
 
-	getOutputFilepath(s)
+	s.getOutputFilepath()
+	// If the file already exists and the -force argument was not used, exit
+	if _, err := os.Stat(s.output); err == nil && !force {
+		fmt.Printf("ERROR: \"%s\" already exists. Skipping.\n", s.output)
+		return 1
+	}
 	fmt.Println("Output file:", s.output)
 
 	// Get the target length
@@ -449,6 +446,7 @@ func (s *State) Fetch(src string) int {
 				s.chunks[id].start = s.chunks[longest].start + s.chunks[longest].length
 				s.rwmutex.Unlock()
 			}
+
 			client, req := s.chunkInit(id)
 			go s.chunkFetch(id, client, req)
 		case <-time.After(time.Second * 30):
@@ -508,22 +506,37 @@ func init() {
 
 func main() {
 	flag.Parse()
-	if flag.NArg() != 1 {
+	if flag.NArg() < 1 {
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	uri := flag.Arg(0)
-	_, err := url.ParseRequestURI(uri)
-	if err != nil {
-		fmt.Printf("ERROR: \"%s\" is not a valid URL.\n", uri)
-		os.Exit(1)
+	if flag.NArg() > 1 {
+		fmt.Printf("Downloading %d files.\n", flag.NArg())
+
+		// Ignore the -name argument when multiple files are provided, just use the URL's filename
+		if name != "" {
+			fmt.Println("The -name argument is not usable when multiple URLs are provided. Ignoring.")
+			name = ""
+		}
 	}
 
 	ctx := context.Background()
-	state := NewState(ctx)
-	context.Background()
-	os.Exit(state.Fetch(uri))
+
+	// Iterate over each URL passed as an argument and download the file
+	for i, uri := range flag.Args() {
+		fmt.Println()
+		_, err := url.ParseRequestURI(uri)
+		if err != nil {
+			fmt.Printf("ERROR: \"%s\" is not a valid URL.\n", uri)
+			continue
+		}
+
+		state := NewState(ctx)
+
+		fmt.Printf("[%d/%d] - %s\n", i+1, flag.NArg(), uri)
+		state.Fetch(uri)
+	}
 }
 
 // vim: noet:ts=4:sw=4:sts=4:spell

@@ -19,12 +19,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -41,9 +44,11 @@ type chunk struct {
 }
 
 type State struct {
-	ctx         context.Context
-	src         string
-	dst         string
+	ctx context.Context
+	src string
+	//dst         string
+	//fname       string
+	output      string
 	bytesTotal  int64
 	bytesPrev   int64
 	circuits    int
@@ -65,9 +70,10 @@ func httpClient(user string) *http.Client {
 	}
 }
 
-func NewState(ctx context.Context, circuits int, minLifetime int, verbose bool) *State {
+func NewState(ctx context.Context) *State {
 	var s State
 	s.circuits = circuits
+	s.output = ""
 	s.minLifetime = time.Duration(minLifetime) * time.Second
 	s.verbose = verbose
 	s.chunks = make([]chunk, s.circuits)
@@ -133,7 +139,7 @@ func (s *State) chunkFetch(id int, client *http.Client, req *http.Request) {
 	}
 
 	// open the output file
-	file, err := os.OpenFile(s.dst, os.O_WRONLY, 0)
+	file, err := os.OpenFile(s.output, os.O_WRONLY, 0)
 	defer file.Close()
 	if err != nil {
 		s.log <- fmt.Sprintf("os OpenFile: %s", err.Error())
@@ -277,7 +283,8 @@ func (s *State) progress() {
 	}
 }
 
-func (s *State) darwin() { // kill the worst performing circuit
+// Kill the worst performing circuit
+func (s *State) darwin() {
 	victim := -1
 	var slowest float64
 	now := time.Now()
@@ -307,27 +314,61 @@ func (s *State) darwin() { // kill the worst performing circuit
 	s.rwmutex.RUnlock()
 }
 
-func (s *State) Fetch(src string) int {
-	// setup file name
-	s.src = src
-	srcUrl, err := url.Parse(src)
-	if err != nil {
-		fmt.Println(err.Error())
-		return 1
-	}
-	path := srcUrl.EscapedPath()
-	slash := strings.LastIndex(path, "/")
-	if slash >= 0 {
-		s.dst = path[slash+1:]
-	} else {
-		s.dst = path
-	}
-	if s.dst == "" {
-		s.dst = "index"
-	}
-	fmt.Println("Output file:", s.dst)
+func getOutputFilepath(s *State) {
+	_, err := os.Stat(destination)
 
-	// get the target length
+	if errors.Is(err, fs.ErrNotExist) {
+		if force {
+			os.MkdirAll(destination, os.ModePerm)
+		} else {
+			fmt.Printf("WARNING: Unable to find destination \"%s\".\nTrying current directory instead.\n", destination)
+			destination = ""
+		}
+	}
+
+	// If no -name argument provided, extract the filename from the URL
+	if name == "" {
+		srcUrl, err := url.Parse(s.src)
+		if err != nil {
+			fmt.Println(err.Error())
+			os.Exit(1)
+		}
+		path := srcUrl.EscapedPath()
+		slash := strings.LastIndex(path, "/")
+		if slash >= 0 {
+			name = path[slash+1:]
+		} else {
+			name = path
+		}
+		if name == "" {
+			name = "index"
+		}
+
+		// Remove URL formatting (e.g. "%20" -> " ", "%C3" -> "ö")
+		decoded, err := url.QueryUnescape(name)
+		if err != nil {
+			fmt.Printf("WARNING: Cannot decode \"%s\" - %v\n", name, err)
+		} else {
+			name = decoded
+		}
+	}
+
+	s.output = filepath.Join(destination, name)
+
+	// If the file already exists and the -force argument was not used, exit
+	if _, err := os.Stat(s.output); err == nil && !force {
+		fmt.Printf("ERROR: \"%s\" already exists.\n", s.output)
+		os.Exit(1)
+	}
+}
+
+func (s *State) Fetch(src string) int {
+	s.src = src
+
+	getOutputFilepath(s)
+	fmt.Println("Output file:", s.output)
+
+	// Get the target length
 	client := httpClient("torget")
 	resp, err := client.Head(s.src)
 	if err != nil {
@@ -341,8 +382,8 @@ func (s *State) Fetch(src string) int {
 	s.bytesTotal = resp.ContentLength
 	fmt.Println("Download length:", s.bytesTotal, "bytes")
 
-	// create the output file
-	file, err := os.Create(s.dst)
+	// Create the output file. This will overwrite an existing file
+	file, err := os.Create(s.output)
 	if file != nil {
 		file.Close()
 	}
@@ -351,7 +392,7 @@ func (s *State) Fetch(src string) int {
 		return 1
 	}
 
-	// initialize chunks
+	// Initialize chunks
 	chunkLen := s.bytesTotal / int64(s.circuits)
 	seq := 0
 	for id := 0; id < s.circuits; id++ {
@@ -362,7 +403,7 @@ func (s *State) Fetch(src string) int {
 	}
 	s.chunks[s.circuits-1].length += s.bytesTotal % int64(s.circuits)
 
-	// spawn initial fetchers
+	// Spawn initial fetchers
 	go s.progress()
 	go func() {
 		for id := 0; id < s.circuits; id++ {
@@ -372,15 +413,16 @@ func (s *State) Fetch(src string) int {
 		}
 	}()
 
-	// spawn additional fetchers as needed
+	// Spawn additional fetchers as needed
 	for {
 		select {
 		case id := <-s.done:
-			if s.chunks[id].length > 0 { // error
-				// resume in a new and hopefully faster circuit
+			if s.chunks[id].length > 0 {
+				// Error. Resume in a new and hopefully faster circuit
 				s.chunks[id].circuit = seq
 				seq++
-			} else { // completed
+			} else {
+				// Completed
 				longest := 0
 				s.rwmutex.RLock()
 				for i := 1; i < s.circuits; i++ {
@@ -389,14 +431,18 @@ func (s *State) Fetch(src string) int {
 					}
 				}
 				s.rwmutex.RUnlock()
-				if s.chunks[longest].length == 0 { // all done
+
+				if s.chunks[longest].length == 0 {
+					// All done
 					s.printPermanent("Download complete")
 					return 0
 				}
-				if s.chunks[longest].length <= 5*torBlock { // too short to split
+				if s.chunks[longest].length <= 5*torBlock {
+					// Too short to split
 					continue
 				}
-				// this circuit is faster, so we split 80%/20%
+
+				// This circuit is faster, so we split 80%/20%
 				s.rwmutex.Lock()
 				s.chunks[id].length = s.chunks[longest].length * 4 / 5
 				s.chunks[longest].length -= s.chunks[id].length
@@ -411,27 +457,73 @@ func (s *State) Fetch(src string) int {
 	}
 }
 
-func main() {
-	circuits := flag.Int("circuits", 20, "concurrent circuits")
-	minLifetime := flag.Int("min-lifetime", 10, "minimum circuit lifetime (seconds)")
-	verbose := flag.Bool("verbose", false, "diagnostic details")
+var circuits int
+var destination string
+var force bool
+var minLifetime int
+var name string
+var verbose bool
+
+func init() {
+	flag.IntVar(&circuits, "circuits", 20, "Concurrent circuits.")
+	flag.IntVar(&circuits, "c", 20, "Concurrent circuits.")
+
+	flag.StringVar(&destination, "destination", "", "Output directory.")
+	flag.StringVar(&destination, "d", "", "Output directory.")
+
+	// No short version of force since it is a dangerous flag. Easy to mistake "-f" as "-filename" or something
+	flag.BoolVar(&force, "force", false, "Will create parent folder(s) and/or overwrite existing files.")
+
+	flag.IntVar(&minLifetime, "min-lifetime", 10, "Minimum circuit lifetime. (seconds)")
+	flag.IntVar(&minLifetime, "l", 10, "Minimum circuit lifetime. (seconds)")
+
+	flag.StringVar(&name, "name", "", "Output filename.")
+	flag.StringVar(&name, "n", "", "Output filename.")
+
+	flag.BoolVar(&verbose, "verbose", false, "Show iagnostic details.")
+	flag.BoolVar(&verbose, "v", false, "Show iagnostic details.")
+
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "torget 2.0, a fast large file downloader over locally installed Tor")
 		fmt.Fprintln(os.Stderr, "Copyright © 2021-2023 Michał Trojnara <Michal.Trojnara@stunnel.org>")
 		fmt.Fprintln(os.Stderr, "Licensed under GNU/GPL version 3")
 		fmt.Fprintln(os.Stderr)
 		fmt.Fprintln(os.Stderr, "Usage: torget [FLAGS] URL")
-		flag.PrintDefaults()
+
+		// Custom print out of the arguments to avoid duplicate entries for long and short versions
+		fmt.Fprintln(os.Stderr, "  -circuits, -c int")
+		fmt.Fprintln(os.Stderr, "        Concurrent circuits. (default 20)")
+		fmt.Fprintln(os.Stderr, "  -destination, -d string")
+		fmt.Fprintln(os.Stderr, "        Output directory. (default current directory)")
+		fmt.Fprintln(os.Stderr, "  -force bool")
+		fmt.Fprintln(os.Stderr, "        Will create parent folder(s) and/or overwrite existing files.")
+		fmt.Fprintln(os.Stderr, "  -min-lifetime, -l int")
+		fmt.Fprintln(os.Stderr, "        Minimum circuit lifetime (seconds). (default 10)")
+		fmt.Fprintln(os.Stderr, "  -name, -n string")
+		fmt.Fprintln(os.Stderr, "        Output filename. (default filename from URL)")
+		fmt.Fprintln(os.Stderr, "  -verbose, -v")
+		fmt.Fprintln(os.Stderr, "        Show diagnostic details.")
 	}
+}
+
+func main() {
 	flag.Parse()
 	if flag.NArg() != 1 {
 		flag.Usage()
 		os.Exit(1)
 	}
+
+	uri := flag.Arg(0)
+	_, err := url.ParseRequestURI(uri)
+	if err != nil {
+		fmt.Printf("ERROR: \"%s\" is not a valid URL.\n", uri)
+		os.Exit(1)
+	}
+
 	ctx := context.Background()
-	state := NewState(ctx, *circuits, *minLifetime, *verbose)
+	state := NewState(ctx)
 	context.Background()
-	os.Exit(state.Fetch(flag.Arg(0)))
+	os.Exit(state.Fetch(uri))
 }
 
 // vim: noet:ts=4:sw=4:sts=4:spell

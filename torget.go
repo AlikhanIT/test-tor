@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -65,9 +66,10 @@ func httpClient(user string) *http.Client {
 	}
 }
 
-func NewState(ctx context.Context, circuits int, minLifetime int, verbose bool) *State {
+func NewState(ctx context.Context, circuits int, destination string, minLifetime int, verbose bool) *State {
 	var s State
 	s.circuits = circuits
+	s.dst = destination
 	s.minLifetime = time.Duration(minLifetime) * time.Second
 	s.verbose = verbose
 	s.chunks = make([]chunk, s.circuits)
@@ -308,22 +310,27 @@ func (s *State) darwin() { // kill the worst performing circuit
 }
 
 func (s *State) Fetch(src string) int {
-	// setup file name
 	s.src = src
-	srcUrl, err := url.Parse(src)
-	if err != nil {
-		fmt.Println(err.Error())
-		return 1
-	}
-	path := srcUrl.EscapedPath()
-	slash := strings.LastIndex(path, "/")
-	if slash >= 0 {
-		s.dst = path[slash+1:]
-	} else {
-		s.dst = path
-	}
-	if s.dst == "" {
-		s.dst = "index"
+
+	// setup file name
+	if _, err := os.Stat(filepath.Dir(s.dst)); os.IsExist(err) {
+		fmt.Printf("WARNING: Unable to find output destination \"%s\".", filepath.Dir(s.dst))
+
+		srcUrl, err := url.Parse(src)
+		if err != nil {
+			fmt.Println(err.Error())
+			return 1
+		}
+		path := srcUrl.EscapedPath()
+		slash := strings.LastIndex(path, "/")
+		if slash >= 0 {
+			s.dst = path[slash+1:]
+		} else {
+			s.dst = path
+		}
+		if s.dst == "" {
+			s.dst = "index"
+		}
 	}
 	fmt.Println("Output file:", s.dst)
 
@@ -413,8 +420,10 @@ func (s *State) Fetch(src string) int {
 
 func main() {
 	circuits := flag.Int("circuits", 20, "concurrent circuits")
+	destination := flag.String("destination", "", "Output filepath. Parent folder must already exist.")
 	minLifetime := flag.Int("min-lifetime", 10, "minimum circuit lifetime (seconds)")
 	verbose := flag.Bool("verbose", false, "diagnostic details")
+
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "torget 2.0, a fast large file downloader over locally installed Tor")
 		fmt.Fprintln(os.Stderr, "Copyright © 2021-2023 Michał Trojnara <Michal.Trojnara@stunnel.org>")
@@ -429,7 +438,7 @@ func main() {
 		os.Exit(1)
 	}
 	ctx := context.Background()
-	state := NewState(ctx, *circuits, *minLifetime, *verbose)
+	state := NewState(ctx, *circuits, *destination, *minLifetime, *verbose)
 	context.Background()
 	os.Exit(state.Fetch(flag.Arg(0)))
 }

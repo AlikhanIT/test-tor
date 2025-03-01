@@ -18,6 +18,7 @@ package main
 */
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -313,8 +314,9 @@ func (s *State) darwin() {
 }
 
 func (s *State) getOutputFilepath() {
-	_, err := os.Stat(destination)
+	var filename string
 
+	_, err := os.Stat(destination)
 	if errors.Is(err, fs.ErrNotExist) {
 		if force {
 			os.MkdirAll(destination, os.ModePerm)
@@ -325,7 +327,7 @@ func (s *State) getOutputFilepath() {
 	}
 
 	// If no -name argument provided, extract the filename from the URL
-	if name == "" || flag.NArg() > 1 {
+	if name == "" {
 		srcUrl, _ := url.Parse(s.src) // We've already parsed the URL, ignore errors here
 		// if err != nil {
 		// 	fmt.Println(err.Error())
@@ -334,24 +336,26 @@ func (s *State) getOutputFilepath() {
 		path := srcUrl.EscapedPath()
 		slash := strings.LastIndex(path, "/")
 		if slash >= 0 {
-			name = path[slash+1:]
+			filename = path[slash+1:]
 		} else {
-			name = path
+			filename = path
 		}
-		if name == "" {
-			name = "index"
+		if filename == "" {
+			filename = "index"
 		}
 
 		// Remove URL formatting (e.g. "%20" -> " ", "%C3" -> "ö")
-		decoded, err := url.QueryUnescape(name)
+		decoded, err := url.QueryUnescape(filename)
 		if err != nil {
-			fmt.Printf("WARNING: Cannot decode \"%s\" - %v\n", name, err)
+			fmt.Printf("WARNING: Cannot decode \"%s\" - %v\n", filename, err)
 		} else {
-			name = decoded
+			filename = decoded
 		}
+	} else {
+		filename = name
 	}
 
-	s.output = filepath.Join(destination, name)
+	s.output = filepath.Join(destination, filename)
 }
 
 func (s *State) Fetch(src string) int {
@@ -463,13 +467,14 @@ var name string
 var verbose bool
 
 func init() {
+	// Set up CLI arguments
 	flag.IntVar(&circuits, "circuits", 20, "Concurrent circuits.")
 	flag.IntVar(&circuits, "c", 20, "Concurrent circuits.")
 
 	flag.StringVar(&destination, "destination", "", "Output directory.")
 	flag.StringVar(&destination, "d", "", "Output directory.")
 
-	// No short version of force since it is a dangerous flag. Easy to mistake "-f" as "-filename" or something
+	// No short version of force since it is a comparatively dangerous flag
 	flag.BoolVar(&force, "force", false, "Will create parent folder(s) and/or overwrite existing files.")
 
 	flag.IntVar(&minLifetime, "min-lifetime", 10, "Minimum circuit lifetime. (seconds)")
@@ -486,7 +491,7 @@ func init() {
 		fmt.Fprintln(os.Stderr, "Copyright © 2021-2023 Michał Trojnara <Michal.Trojnara@stunnel.org>")
 		fmt.Fprintln(os.Stderr, "Licensed under GNU/GPL version 3")
 		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, "Usage: torget [FLAGS] URL")
+		fmt.Fprintln(os.Stderr, "Usage: torget [FLAGS] file.txt | URL [URL2...]")
 
 		// Custom print out of the arguments to avoid duplicate entries for long and short versions
 		fmt.Fprintln(os.Stderr, "  -circuits, -c int")
@@ -511,20 +516,52 @@ func main() {
 		os.Exit(1)
 	}
 
-	if flag.NArg() > 1 {
-		fmt.Printf("Downloading %d files.\n", flag.NArg())
+	var uris []string
+
+	if flag.NArg() == 1 {
+		// Only one non-flag argument. Check if it's a URL or a text file
+		if _, err := os.Stat(flag.Arg(0)); err == nil {
+			// Found a file on disk, read URLs from it
+			file, err := os.Open(flag.Arg(0))
+			if err != nil {
+				fmt.Printf("ERROR: argument \"%s\" is not a valid URL or file.\n%v\n", flag.Arg(0), err)
+			}
+			defer file.Close()
+
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				line := scanner.Text()
+				// Filter out blank lines
+				if line != "" {
+					uris = append(uris, line)
+				}
+			}
+		} else {
+			// No file found on disk, treating argument as URL
+			uris = append(uris, flag.Arg(0))
+		}
+	} else {
+		// Multiple URLs passed as non-flag arguments
+		uris = flag.Args()
+	}
+
+	if len(uris) > 1 {
+		fmt.Printf("Downloading %d files.\n", len(uris))
 
 		// Ignore the -name argument when multiple files are provided, just use the URL's filename
 		if name != "" {
 			fmt.Println("The -name argument is not usable when multiple URLs are provided. Ignoring.")
 			name = ""
 		}
+	} else if len(uris) < 1 {
+		fmt.Println("ERROR: No URLs found.")
+		os.Exit(1)
 	}
 
 	ctx := context.Background()
 
 	// Iterate over each URL passed as an argument and download the file
-	for i, uri := range flag.Args() {
+	for i, uri := range uris {
 		fmt.Println()
 		_, err := url.ParseRequestURI(uri)
 		if err != nil {
@@ -534,7 +571,7 @@ func main() {
 
 		state := NewState(ctx)
 
-		fmt.Printf("[%d/%d] - %s\n", i+1, flag.NArg(), uri)
+		fmt.Printf("[%d/%d] - %s\n", i+1, len(uris), uri)
 		state.Fetch(uri)
 	}
 }

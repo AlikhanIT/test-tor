@@ -77,7 +77,7 @@ If the file already exists, you will receive an error.
 ## Downloading Multiple Files
 
 ### With multiple URLs as arguments
-You may pass more than one URL to torget and download them all.
+You may pass more than one URL to torget and download them all sequentially.
 
     $ ./torget -destination "/music" "https://archive.org/download/ca200_cjazz/ca200_Various__Clinical_Jazz_CD1.zip" "https://archive.org/download/ca200_cjazz/ca200_Various__Clinical_Jazz_CD2v.zip" "https://archive.org/download/ca200_cjazz/ca200_Various__Clinical_Jazz_CD3.zip"
     Downloading 3 files.
@@ -95,4 +95,33 @@ You may pass more than one URL to torget and download them all.
     [3/3] - https://archive.org/download/ca200_cjazz/ca200_Various__Clinical_Jazz_CD3.zip
     Output file: /music/ca200_Various__Clinical_Jazz_CD3.zip
     Download length: 152713364 bytes
+    Download complete
+
+### With a local text file
+You may pass the path of a text file containing multiple URLs on each line to download them all sequentially.
+
+#### /music/downloads.txt
+    
+    https://archive.org/download/ca200_cjazz/ca200_Various__Clinical_Jazz_CD4.zip
+    https://archive.org/download/ca200_cjazz/ca200_Various__Clinical_Jazz_CD5.zip
+    https://archive.org/download/ca200_cjazz/ca200_Various__Clinical_Jazz_CD6.zip
+
+#### Run torget
+
+    $ torget -destination "/music" "/music/downloads.txt"
+    Downloading 3 files.
+
+    [1/3] - https://archive.org/download/ca200_cjazz/ca200_Various__Clinical_Jazz_CD4.zip
+    Output file: /music/ca200_Various__Clinical_Jazz_CD4.zip
+    Download length: 163400499 bytes
+    Download complete
+    
+    [2/3] - https://archive.org/download/ca200_cjazz/ca200_Various__Clinical_Jazz_CD5.zip
+    Output file: /music/ca200_Various__Clinical_Jazz_CD5.zip
+    Download length: 160286763 bytes
+    Download complete
+    
+    [3/3] - https://archive.org/download/ca200_cjazz/ca200_Various__Clinical_Jazz_CD6.zip
+    Output file: /music/ca200_Various__Clinical_Jazz_CD6.zip
+    Download length: 166744974 bytes
     Download complete

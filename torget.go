@@ -60,7 +60,7 @@ type State struct {
 	rwmutex     sync.RWMutex
 }
 
-const torBlock = 8000 // the longest plain text block in Tor
+const torBlock = 8000 // The longest plain text block in Tor
 
 func httpClient(user string) *http.Client {
 	proxyUrl, _ := url.Parse(fmt.Sprint("socks5://"+user+":"+user+"@127.0.0.1:%d/", torPort))
@@ -137,7 +137,7 @@ func (s *State) chunkFetch(id int, client *http.Client, req *http.Request) {
 		return
 	}
 
-	// open the output file
+	// Open the output file
 	file, err := os.OpenFile(s.output, os.O_WRONLY, 0)
 	if err != nil {
 		s.log <- fmt.Sprintf("os OpenFile: %s", err.Error())
@@ -151,13 +151,13 @@ func (s *State) chunkFetch(id int, client *http.Client, req *http.Request) {
 		return
 	}
 
-	// copy network data to the output file
+	// Copy network data to the output file
 	buffer := make([]byte, torBlock)
 	for {
 		n, err := resp.Body.Read(buffer)
 		if n > 0 {
 			file.Write(buffer[:n])
-			// enough to RLock(), as we only modify our own chunk
+			// Enough to RLock(), as we only modify our own chunk
 			s.rwmutex.RLock()
 			if int64(n) < s.chunks[id].length {
 				s.chunks[id].start += int64(n)
@@ -211,9 +211,9 @@ func (s *State) printLogs() {
 	for i := 0; i < n; i++ {
 		logs[i] = <-s.log
 	}
-	logs[n] = "stop" // not an expected log line
+	logs[n] = "stop" // Not an expected log line
 	sort.Strings(logs)
-	prevLog := "start" // not an expected log line
+	prevLog := "start" // Not an expected log line
 	cnt := 0
 	for _, log := range logs {
 		if log == prevLog {
@@ -238,7 +238,7 @@ func (s *State) ignoreLogs() {
 }
 
 func (s *State) statusLine() (status string) {
-	// calculate bytes transferred since the previous invocation
+	// Calculate bytes transferred since the previous invocation
 	curr := s.bytesTotal
 	s.rwmutex.RLock()
 	for id := 0; id < s.circuits; id++ {
@@ -306,8 +306,6 @@ func (s *State) darwin() {
 		slowest = throughput
 	}
 	if victim >= 0 {
-		// fmt.Printf("killing %5.1fs %5.1fkB/s",
-		//	now.Sub(s.chunks[victim].since).Seconds(), slowest/1024.0)
 		s.chunks[victim].cancel()
 		s.chunks[victim].cancel = nil
 	}
@@ -330,12 +328,9 @@ func (s *State) getOutputFilepath() {
 	// If no -name argument provided, extract the filename from the URL
 	if name == "" {
 		srcUrl, _ := url.Parse(s.src) // We've already parsed the URL, ignore errors here
-		// if err != nil {
-		// 	fmt.Println(err.Error())
-		// 	return 1
-		// }
 		path := srcUrl.EscapedPath()
 		slash := strings.LastIndex(path, "/")
+
 		if slash >= 0 {
 			filename = path[slash+1:]
 		} else {
@@ -397,7 +392,7 @@ func (s *State) Fetch(src string) int {
 	// Initialize chunks
 	chunkLen := s.bytesTotal / int64(s.circuits)
 	seq := 0
-	for id := 0; id < s.circuits; id++ {
+	for id := range s.circuits {
 		s.chunks[id].start = int64(id) * chunkLen
 		s.chunks[id].length = chunkLen
 		s.chunks[id].circuit = seq
@@ -408,10 +403,10 @@ func (s *State) Fetch(src string) int {
 	// Spawn initial fetchers
 	go s.progress()
 	go func() {
-		for id := 0; id < s.circuits; id++ {
+		for id := range s.circuits {
 			client, req := s.chunkInit(id)
 			go s.chunkFetch(id, client, req)
-			time.Sleep(499 * time.Millisecond) // be gentle to the local tor daemon
+			time.Sleep(499 * time.Millisecond) // Be gentle to the local tor daemon
 		}
 	}()
 
@@ -584,5 +579,3 @@ func main() {
 		state.Fetch(uri)
 	}
 }
-
-// vim: noet:ts=4:sw=4:sts=4:spell

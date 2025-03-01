@@ -16,7 +16,7 @@
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
-# General folder for odds and ends that don't need to be comitted
+# General folder for odds and ends that don't need to be committed.
 /ignore/
 
 # Emacs backup files

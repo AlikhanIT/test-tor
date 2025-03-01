@@ -18,6 +18,7 @@ package main
 */
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -44,10 +45,8 @@ type chunk struct {
 }
 
 type State struct {
-	ctx context.Context
-	src string
-	//dst         string
-	//fname       string
+	ctx         context.Context
+	src         string
 	output      string
 	bytesTotal  int64
 	bytesPrev   int64
@@ -140,11 +139,12 @@ func (s *State) chunkFetch(id int, client *http.Client, req *http.Request) {
 
 	// open the output file
 	file, err := os.OpenFile(s.output, os.O_WRONLY, 0)
-	defer file.Close()
 	if err != nil {
 		s.log <- fmt.Sprintf("os OpenFile: %s", err.Error())
 		return
 	}
+	defer file.Close()
+
 	_, err = file.Seek(s.chunks[id].start, io.SeekStart)
 	if err != nil {
 		s.log <- fmt.Sprintf("File Seek: %s", err.Error())
@@ -314,9 +314,10 @@ func (s *State) darwin() {
 	s.rwmutex.RUnlock()
 }
 
-func getOutputFilepath(s *State) {
-	_, err := os.Stat(destination)
+func (s *State) getOutputFilepath() {
+	var filename string
 
+	_, err := os.Stat(destination)
 	if errors.Is(err, fs.ErrNotExist) {
 		if force {
 			os.MkdirAll(destination, os.ModePerm)
@@ -328,44 +329,45 @@ func getOutputFilepath(s *State) {
 
 	// If no -name argument provided, extract the filename from the URL
 	if name == "" {
-		srcUrl, err := url.Parse(s.src)
-		if err != nil {
-			fmt.Println(err.Error())
-			os.Exit(1)
-		}
+		srcUrl, _ := url.Parse(s.src) // We've already parsed the URL, ignore errors here
+		// if err != nil {
+		// 	fmt.Println(err.Error())
+		// 	return 1
+		// }
 		path := srcUrl.EscapedPath()
 		slash := strings.LastIndex(path, "/")
 		if slash >= 0 {
-			name = path[slash+1:]
+			filename = path[slash+1:]
 		} else {
-			name = path
+			filename = path
 		}
-		if name == "" {
-			name = "index"
+		if filename == "" {
+			filename = "index"
 		}
 
 		// Remove URL formatting (e.g. "%20" -> " ", "%C3" -> "ö")
-		decoded, err := url.QueryUnescape(name)
+		decoded, err := url.QueryUnescape(filename)
 		if err != nil {
-			fmt.Printf("WARNING: Cannot decode \"%s\" - %v\n", name, err)
+			fmt.Printf("WARNING: Cannot decode \"%s\" - %v\n", filename, err)
 		} else {
-			name = decoded
+			filename = decoded
 		}
+	} else {
+		filename = name
 	}
 
-	s.output = filepath.Join(destination, name)
-
-	// If the file already exists and the -force argument was not used, exit
-	if _, err := os.Stat(s.output); err == nil && !force {
-		fmt.Printf("ERROR: \"%s\" already exists.\n", s.output)
-		os.Exit(1)
-	}
+	s.output = filepath.Join(destination, filename)
 }
 
 func (s *State) Fetch(src string) int {
 	s.src = src
 
-	getOutputFilepath(s)
+	s.getOutputFilepath()
+	// If the file already exists and the -force argument was not used, exit
+	if _, err := os.Stat(s.output); err == nil && !force {
+		fmt.Printf("ERROR: \"%s\" already exists. Skipping.\n", s.output)
+		return 1
+	}
 	fmt.Println("Output file:", s.output)
 
 	// Get the target length
@@ -449,6 +451,7 @@ func (s *State) Fetch(src string) int {
 				s.chunks[id].start = s.chunks[longest].start + s.chunks[longest].length
 				s.rwmutex.Unlock()
 			}
+
 			client, req := s.chunkInit(id)
 			go s.chunkFetch(id, client, req)
 		case <-time.After(time.Second * 30):
@@ -465,13 +468,14 @@ var name string
 var verbose bool
 
 func init() {
+	// Set up CLI arguments
 	flag.IntVar(&circuits, "circuits", 20, "Concurrent circuits.")
 	flag.IntVar(&circuits, "c", 20, "Concurrent circuits.")
 
 	flag.StringVar(&destination, "destination", "", "Output directory.")
 	flag.StringVar(&destination, "d", "", "Output directory.")
 
-	// No short version of force since it is a dangerous flag. Easy to mistake "-f" as "-filename" or something
+	// No short version of force since it is a comparatively dangerous flag
 	flag.BoolVar(&force, "force", false, "Will create parent folder(s) and/or overwrite existing files.")
 
 	flag.IntVar(&minLifetime, "min-lifetime", 10, "Minimum circuit lifetime. (seconds)")
@@ -488,7 +492,7 @@ func init() {
 		fmt.Fprintln(os.Stderr, "Copyright © 2021-2023 Michał Trojnara <Michal.Trojnara@stunnel.org>")
 		fmt.Fprintln(os.Stderr, "Licensed under GNU/GPL version 3")
 		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, "Usage: torget [FLAGS] URL")
+		fmt.Fprintln(os.Stderr, "Usage: torget [FLAGS] {file.txt | URL [URL2...]}")
 
 		// Custom print out of the arguments to avoid duplicate entries for long and short versions
 		fmt.Fprintln(os.Stderr, "  -circuits, -c int")
@@ -508,22 +512,70 @@ func init() {
 
 func main() {
 	flag.Parse()
-	if flag.NArg() != 1 {
+	if flag.NArg() < 1 {
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	uri := flag.Arg(0)
-	_, err := url.ParseRequestURI(uri)
-	if err != nil {
-		fmt.Printf("ERROR: \"%s\" is not a valid URL.\n", uri)
+	var uris []string
+
+	if flag.NArg() == 1 {
+		// Only one non-flag argument. Check if it's a URL or a text file
+		if _, err := os.Stat(flag.Arg(0)); err == nil {
+			// Found a file on disk, read URLs from it
+			file, err := os.Open(flag.Arg(0))
+			if err != nil {
+				fmt.Printf("ERROR: argument \"%s\" is not a valid URL or file.\n%v\n", flag.Arg(0), err)
+			}
+			defer file.Close()
+
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				line := scanner.Text()
+				// Filter out blank lines
+				if line != "" {
+					uris = append(uris, line)
+				}
+			}
+		} else {
+			// No file found on disk, treating argument as URL
+			uris = append(uris, flag.Arg(0))
+		}
+	} else {
+		// Multiple URLs passed as non-flag arguments
+		uris = flag.Args()
+	}
+
+	if len(uris) > 1 {
+		fmt.Printf("Downloading %d files.\n", len(uris))
+
+		// Ignore the -name argument when multiple files are provided, just use the URL's filename
+		if name != "" {
+			fmt.Println("The -name argument is not usable when multiple URLs are provided. Ignoring.")
+			name = ""
+		}
+	} else if len(uris) < 1 {
+		fmt.Println("ERROR: No URLs found.")
 		os.Exit(1)
 	}
 
 	ctx := context.Background()
-	state := NewState(ctx)
-	context.Background()
-	os.Exit(state.Fetch(uri))
+
+	// Iterate over each URL passed as an argument and download the file
+	for i, uri := range uris {
+		_, err := url.ParseRequestURI(uri)
+		if err != nil {
+			fmt.Printf("ERROR: \"%s\" is not a valid URL.\n", uri)
+			continue
+		}
+
+		if len(uris) < 1 {
+			fmt.Printf("\n[%d/%d] - %s\n", i+1, len(uris), uri)
+		}
+
+		state := NewState(ctx)
+		state.Fetch(uri)
+	}
 }
 
 // vim: noet:ts=4:sw=4:sts=4:spell

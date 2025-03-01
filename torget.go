@@ -496,7 +496,7 @@ func init() {
 
 		fmt.Fprintln(w, "torget 2.0, a fast large file downloader over locally installed Tor")
 		fmt.Fprintln(w, "Copyright © 2021-2023 Michał Trojnara <Michal.Trojnara@stunnel.org>")
-		fmt.Fprintln(w, "Licensed under GNU/GPL version 3")
+		fmt.Fprintln(w, "Licensed under GNU GPL version 3 <https://www.gnu.org/licenses/>")
 		fmt.Fprintln(w, "\nUsage: torget [FLAGS] {file.txt | URL [URL2...]}")
 
 		// Custom print out of the arguments to avoid duplicate entries for long and short versions

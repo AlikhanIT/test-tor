@@ -492,7 +492,7 @@ func init() {
 		fmt.Fprintln(os.Stderr, "Copyright © 2021-2023 Michał Trojnara <Michal.Trojnara@stunnel.org>")
 		fmt.Fprintln(os.Stderr, "Licensed under GNU/GPL version 3")
 		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, "Usage: torget [FLAGS] file.txt | URL [URL2...]")
+		fmt.Fprintln(os.Stderr, "Usage: torget [FLAGS] {file.txt | URL [URL2...]}")
 
 		// Custom print out of the arguments to avoid duplicate entries for long and short versions
 		fmt.Fprintln(os.Stderr, "  -circuits, -c int")

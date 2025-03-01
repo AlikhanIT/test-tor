@@ -24,19 +24,19 @@ Onion services are fully supported.
     Copyright © 2021-2023 Michał Trojnara <Michal.Trojnara@stunnel.org>
     Licensed under GNU/GPL version 3
 
-    Usage: torget [FLAGS] URL [URL2...]
-    -circuits, -c int
-          Concurrent circuits. (default 20)
-    -destination, -d string
-          Output directory. (default current directory)
-    -force bool
-          Will create parent folder(s) and/or overwrite existing files.
-    -min-lifetime, -l int
-          Minimum circuit lifetime (seconds). (default 10)
-    -name, -n string
-          Output filename. (default filename from URL)
-    -verbose, -v
-          Show diagnostic details.
+    Usage: torget [FLAGS] {file.txt | URL [URL2...]}
+      -circuits, -c int
+            Concurrent circuits. (default 20)
+      -destination, -d string
+            Output directory. (default current directory)
+      -force bool
+            Will create parent folder(s) and/or overwrite existing files.
+      -min-lifetime, -l int
+            Minimum circuit lifetime (seconds). (default 10)
+      -name, -n string
+            Output filename. (default filename from URL)
+      -verbose, -v
+            Show diagnostic details.
 
 ### Download a file to the current directory
     $ ./torget "https://archive.org/download/grimaces-birthday-game/Grimace%27s%20Birthday%20%28World%29%20%28v1.7%29%20%28Aftermarket%29%20%28Unl%29.gbc"

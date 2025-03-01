@@ -63,7 +63,7 @@ type State struct {
 const torBlock = 8000 // the longest plain text block in Tor
 
 func httpClient(user string) *http.Client {
-	proxyUrl, _ := url.Parse("socks5://" + user + ":" + user + "@127.0.0.1:9050/")
+	proxyUrl, _ := url.Parse(fmt.Sprint("socks5://"+user+":"+user+"@127.0.0.1:%d/", torPort))
 	return &http.Client{
 		Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)},
 	}
@@ -465,6 +465,7 @@ var destination string
 var force bool
 var minLifetime int
 var name string
+var torPort int
 var verbose bool
 
 func init() {
@@ -483,6 +484,9 @@ func init() {
 
 	flag.StringVar(&name, "name", "", "Output filename.")
 	flag.StringVar(&name, "n", "", "Output filename.")
+
+	flag.IntVar(&torPort, "tor-port", 9050, "Port your Tor service is listening on.")
+	flag.IntVar(&torPort, "p", 9050, "Port your Tor service is listening on.")
 
 	flag.BoolVar(&verbose, "verbose", false, "Show iagnostic details.")
 	flag.BoolVar(&verbose, "v", false, "Show iagnostic details.")
@@ -505,6 +509,8 @@ func init() {
 		fmt.Fprintln(os.Stderr, "        Minimum circuit lifetime (seconds). (default 10)")
 		fmt.Fprintln(os.Stderr, "  -name, -n string")
 		fmt.Fprintln(os.Stderr, "        Output filename. (default filename from URL)")
+		fmt.Fprintln(os.Stderr, "  -tor-port, -p int")
+		fmt.Fprintln(os.Stderr, "        Port your Tor service is listening on. (default 9050)")
 		fmt.Fprintln(os.Stderr, "  -verbose, -v")
 		fmt.Fprintln(os.Stderr, "        Show diagnostic details.")
 	}

@@ -1,7 +1,7 @@
 $OSes = @("windows", "linux", "freebsd", "openbsd", "netbsd", "darwin")
 $Env:GOARCH = "amd64"
 
-New-Item -Path "./dist/" -ItemType Directory
+New-Item -Path "./dist/" -ItemType Directory -ErrorAction SilentlyContinue
 
 $OSes | ForEach-Object {
     Write-Host "Building for $_..." -NoNewline
@@ -10,4 +10,4 @@ $OSes | ForEach-Object {
     Write-Host " Done" -ForegroundColor Green
 }
 
-Move-Item -Path "./dist/torget-windows" -Destination "./dist/torget.exe"
+Move-Item -Path "./dist/torget-windows" -Destination "./dist/torget.exe" -Force

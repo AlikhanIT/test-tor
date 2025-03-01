@@ -15,3 +15,13 @@
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+
+# General folder for odds and ends that don't need to be comitted
+/ignore/
+
+# Emacs backup files
+*~
+\#*\#
+
+# VS Code folder
+.vscode/

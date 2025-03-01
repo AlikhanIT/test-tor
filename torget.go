@@ -139,11 +139,12 @@ func (s *State) chunkFetch(id int, client *http.Client, req *http.Request) {
 
 	// open the output file
 	file, err := os.OpenFile(s.output, os.O_WRONLY, 0)
-	defer file.Close()
 	if err != nil {
 		s.log <- fmt.Sprintf("os OpenFile: %s", err.Error())
 		return
 	}
+	defer file.Close()
+
 	_, err = file.Seek(s.chunks[id].start, io.SeekStart)
 	if err != nil {
 		s.log <- fmt.Sprintf("File Seek: %s", err.Error())
@@ -562,16 +563,17 @@ func main() {
 
 	// Iterate over each URL passed as an argument and download the file
 	for i, uri := range uris {
-		fmt.Println()
 		_, err := url.ParseRequestURI(uri)
 		if err != nil {
 			fmt.Printf("ERROR: \"%s\" is not a valid URL.\n", uri)
 			continue
 		}
 
-		state := NewState(ctx)
+		if len(uris) < 1 {
+			fmt.Printf("\n[%d/%d] - %s\n", i+1, len(uris), uri)
+		}
 
-		fmt.Printf("[%d/%d] - %s\n", i+1, len(uris), uri)
+		state := NewState(ctx)
 		state.Fetch(uri)
 	}
 }

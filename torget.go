@@ -492,27 +492,28 @@ func init() {
 	flag.BoolVar(&verbose, "v", false, "Show iagnostic details.")
 
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "torget 2.0, a fast large file downloader over locally installed Tor")
-		fmt.Fprintln(os.Stderr, "Copyright © 2021-2023 Michał Trojnara <Michal.Trojnara@stunnel.org>")
-		fmt.Fprintln(os.Stderr, "Licensed under GNU/GPL version 3")
-		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, "Usage: torget [FLAGS] {file.txt | URL [URL2...]}")
+		w := flag.CommandLine.Output()
+
+		fmt.Fprintln(w, "torget 2.0, a fast large file downloader over locally installed Tor")
+		fmt.Fprintln(w, "Copyright © 2021-2023 Michał Trojnara <Michal.Trojnara@stunnel.org>")
+		fmt.Fprintln(w, "Licensed under GNU/GPL version 3")
+		fmt.Fprintln(w, "\nUsage: torget [FLAGS] {file.txt | URL [URL2...]}")
 
 		// Custom print out of the arguments to avoid duplicate entries for long and short versions
-		fmt.Fprintln(os.Stderr, "  -circuits, -c int")
-		fmt.Fprintln(os.Stderr, "        Concurrent circuits. (default 20)")
-		fmt.Fprintln(os.Stderr, "  -destination, -d string")
-		fmt.Fprintln(os.Stderr, "        Output directory. (default current directory)")
-		fmt.Fprintln(os.Stderr, "  -force bool")
-		fmt.Fprintln(os.Stderr, "        Will create parent folder(s) and/or overwrite existing files.")
-		fmt.Fprintln(os.Stderr, "  -min-lifetime, -l int")
-		fmt.Fprintln(os.Stderr, "        Minimum circuit lifetime (seconds). (default 10)")
-		fmt.Fprintln(os.Stderr, "  -name, -n string")
-		fmt.Fprintln(os.Stderr, "        Output filename. (default filename from URL)")
-		fmt.Fprintln(os.Stderr, "  -tor-port, -p int")
-		fmt.Fprintln(os.Stderr, "        Port your Tor service is listening on. (default 9050)")
-		fmt.Fprintln(os.Stderr, "  -verbose, -v")
-		fmt.Fprintln(os.Stderr, "        Show diagnostic details.")
+		fmt.Fprintln(w, "  -circuits, -c int")
+		fmt.Fprintln(w, "        Concurrent circuits. (default 20)")
+		fmt.Fprintln(w, "  -destination, -d string")
+		fmt.Fprintln(w, "        Output directory. (default current directory)")
+		fmt.Fprintln(w, "  -force bool")
+		fmt.Fprintln(w, "        Will create parent folder(s) and/or overwrite existing files.")
+		fmt.Fprintln(w, "  -min-lifetime, -l int")
+		fmt.Fprintln(w, "        Minimum circuit lifetime (seconds). (default 10)")
+		fmt.Fprintln(w, "  -name, -n string")
+		fmt.Fprintln(w, "        Output filename. (default filename from URL)")
+		fmt.Fprintln(w, "  -tor-port, -p int")
+		fmt.Fprintln(w, "        Port your Tor service is listening on. (default 9050)")
+		fmt.Fprintln(w, "  -verbose, -v")
+		fmt.Fprintln(w, "        Show diagnostic details.")
 	}
 }
 

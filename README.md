@@ -14,7 +14,7 @@ impactful are:
 
 ## Building From Source
 
-    $ git clone https://github.com/BryanCuneo/tor-dl/
+    $ git clone https://github.com/BryanCuneo/tor-dl.git
     [...]
     $ cd tor-dl
     $ go build tor-dl.go

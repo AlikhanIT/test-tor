@@ -86,6 +86,7 @@ func NewState(ctx context.Context) *State {
 	s.log = make(chan string, 10)
 	st, _ := os.Stdout.Stat()
 	s.terminal = st.Mode()&os.ModeCharDevice == os.ModeCharDevice
+
 	return &s
 }
 
@@ -243,7 +244,7 @@ func (s *State) statusLine() (status string) {
 	// Calculate bytes transferred since the previous invocation
 	curr := s.bytesTotal
 	s.rwmutex.RLock()
-	for id := 0; id < s.circuits; id++ {
+	for id := range s.circuits {
 		curr -= s.chunks[id].length
 	}
 	s.rwmutex.RUnlock()
@@ -274,15 +275,12 @@ func (s *State) statusLine() (status string) {
 }
 
 func (s *State) progress() {
-	for {
-		time.Sleep(time.Second)
-		if s.verbose {
-			s.printLogs()
-		} else {
-			s.ignoreLogs()
-		}
-		s.printTemporary(s.statusLine())
+	if s.verbose {
+		s.printLogs()
+	} else {
+		s.ignoreLogs()
 	}
+	s.printTemporary(s.statusLine())
 }
 
 // Kill the worst performing circuit
@@ -292,7 +290,7 @@ func (s *State) darwin() {
 	now := time.Now()
 
 	s.rwmutex.RLock()
-	for id := 0; id < s.circuits; id++ {
+	for id := range s.circuits {
 		if s.chunks[id].cancel == nil {
 			continue
 		}
@@ -358,6 +356,7 @@ func (s *State) getOutputFilepath() {
 
 func (s *State) Fetch(src string) int {
 	s.src = src
+	startTime := time.Now()
 
 	s.getOutputFilepath()
 	// If the file already exists and the -force argument was not used, exit
@@ -402,8 +401,23 @@ func (s *State) Fetch(src string) int {
 	}
 	s.chunks[s.circuits-1].length += s.bytesTotal % int64(s.circuits)
 
+	// Update status message every 1 second
+	stop_status := make(chan bool)
+	go func() {
+		for {
+			time.Sleep(time.Second)
+
+			select {
+			case <-stop_status:
+				close(stop_status)
+				return
+			default:
+				s.progress()
+			}
+		}
+	}()
+
 	// Spawn initial fetchers
-	go s.progress()
 	go func() {
 		for id := range s.circuits {
 			client, req := s.chunkInit(id)
@@ -433,7 +447,9 @@ func (s *State) Fetch(src string) int {
 
 				if s.chunks[longest].length == 0 {
 					// All done
-					s.printPermanent("Download complete")
+					s.printPermanent(fmt.Sprintf("Download complete - %s", time.Since(startTime).Round(time.Second)))
+					stop_status <- true
+
 					return 0
 				}
 				if s.chunks[longest].length <= 5*torBlock {
@@ -563,7 +579,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx := context.Background()
+	bkgr := context.Background()
 
 	// Iterate over each URL passed as an argument and download the file
 	for i, uri := range uris {
@@ -577,6 +593,7 @@ func main() {
 			fmt.Printf("\n[%d/%d] - %s\n", i+1, len(uris), uri)
 		}
 
+		ctx := context.WithoutCancel(bkgr)
 		state := NewState(ctx)
 		state.Fetch(uri)
 	}

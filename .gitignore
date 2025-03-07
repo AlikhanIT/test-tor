@@ -5,7 +5,7 @@
 *.so
 *.dylib
 /dist/
-/torget
+/tor-dl
 
 # Test binary, built with `go test -c`
 *.test

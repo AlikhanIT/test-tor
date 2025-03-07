@@ -63,7 +63,12 @@ type State struct {
 const torBlock = 8000 // The longest plain text block in Tor
 
 func httpClient(user string) *http.Client {
-	proxyUrl, _ := url.Parse(fmt.Sprint("socks5://"+user+":"+user+"@127.0.0.1:%d/", torPort))
+	proxyUrl, err := url.Parse(fmt.Sprintf("socks5://%s:%s@127.0.0.1:%d/", user, user, torPort))
+	if err != nil {
+		fmt.Printf("ERROR - Failed to parse URL with user '%s' and port '%d'\n%v", user, torPort, err)
+		os.Exit(1)
+	}
+
 	return &http.Client{
 		Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)},
 	}
@@ -179,10 +184,7 @@ func (s *State) chunkFetch(id int, client *http.Client, req *http.Request) {
 }
 
 func (s *State) getExitNode(id int, client *http.Client) error {
-	req, err := http.NewRequest(http.MethodGet, "https://check.torproject.org/api/ip", nil)
-	if err != nil {
-		return fmt.Errorf("http NewRequest: %s", err.Error())
-	}
+	req, _ := http.NewRequest(http.MethodGet, "https://check.torproject.org/api/ip", nil)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -369,7 +371,7 @@ func (s *State) Fetch(src string) int {
 	client := httpClient("torget")
 	resp, err := client.Head(s.src)
 	if err != nil {
-		fmt.Println(err.Error())
+		fmt.Printf("ERROR - Unable to connect to Tor proxy. Is it running?: %v\n", err)
 		return 1
 	}
 	if resp.ContentLength <= 0 {
@@ -571,7 +573,7 @@ func main() {
 			continue
 		}
 
-		if len(uris) < 1 {
+		if len(uris) > 1 {
 			fmt.Printf("\n[%d/%d] - %s\n", i+1, len(uris), uri)
 		}
 

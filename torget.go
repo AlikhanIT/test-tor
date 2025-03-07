@@ -62,6 +62,23 @@ type State struct {
 
 const torBlock = 8000 // The longest plain text block in Tor
 
+// Basic function to determine human-readable file sizes
+func humanReadableSize(sizeInBytes float32) string {
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	i := 0
+
+	for {
+		if sizeInBytes >= 1024 {
+			sizeInBytes /= 1024
+			i += 1
+		} else {
+			break
+		}
+	}
+
+	return fmt.Sprintf("%6.2f %s", sizeInBytes, units[i])
+}
+
 func httpClient(user string) *http.Client {
 	proxyUrl, err := url.Parse(fmt.Sprintf("socks5://%s:%s@127.0.0.1:%d/", user, user, torPort))
 	if err != nil {
@@ -254,19 +271,12 @@ func (s *State) statusLine() (status string) {
 			100*float32(curr)/float32(s.bytesTotal))
 	} else {
 		speed := float32(curr-s.bytesPrev) / 1000
-		prefix := "K"
-		if speed >= 1000 {
-			speed /= 1000
-			prefix = "M"
-		}
-		if speed >= 1000 {
-			speed /= 1000
-			prefix = "G"
-		}
+		humanSpeed := humanReadableSize(speed)
+
 		seconds := (s.bytesTotal - curr) / (curr - s.bytesPrev)
-		status = fmt.Sprintf("%6.2f%% done, %6.2f %sB/s, ETA %d:%02d:%02d",
+		status = fmt.Sprintf("%6.2f%% done, %s/s, ETA %d:%02d:%02d",
 			100*float32(curr)/float32(s.bytesTotal),
-			speed, prefix,
+			humanSpeed,
 			seconds/3600, seconds/60%60, seconds%60)
 	}
 
@@ -378,7 +388,7 @@ func (s *State) Fetch(src string) int {
 		return 1
 	}
 	s.bytesTotal = resp.ContentLength
-	fmt.Println("Download length:", s.bytesTotal, "bytes")
+	fmt.Println("Download length:", humanReadableSize(float32(s.bytesTotal)))
 
 	// Create the output file. This will overwrite an existing file
 	file, err := os.Create(s.output)

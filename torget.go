@@ -60,10 +60,32 @@ type State struct {
 	rwmutex     sync.RWMutex
 }
 
-const torBlock = 8000 // the longest plain text block in Tor
+const torBlock = 8000 // The longest plain text block in Tor
+
+// Basic function to determine human-readable file sizes
+func humanReadableSize(sizeInBytes float32) string {
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}
+	i := 0
+
+	for {
+		if sizeInBytes >= 1024 {
+			sizeInBytes /= 1024
+			i += 1
+		} else {
+			break
+		}
+	}
+
+	return fmt.Sprintf("%6.2f %s", sizeInBytes, units[i])
+}
 
 func httpClient(user string) *http.Client {
-	proxyUrl, _ := url.Parse("socks5://" + user + ":" + user + "@127.0.0.1:9050/")
+	proxyUrl, err := url.Parse(fmt.Sprintf("socks5://%s:%s@127.0.0.1:%d/", user, user, torPort))
+	if err != nil {
+		fmt.Printf("ERROR - Failed to parse URL with user '%s' and port '%d'\n%v", user, torPort, err)
+		os.Exit(1)
+	}
+
 	return &http.Client{
 		Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)},
 	}
@@ -81,6 +103,7 @@ func NewState(ctx context.Context) *State {
 	s.log = make(chan string, 10)
 	st, _ := os.Stdout.Stat()
 	s.terminal = st.Mode()&os.ModeCharDevice == os.ModeCharDevice
+
 	return &s
 }
 
@@ -137,7 +160,7 @@ func (s *State) chunkFetch(id int, client *http.Client, req *http.Request) {
 		return
 	}
 
-	// open the output file
+	// Open the output file
 	file, err := os.OpenFile(s.output, os.O_WRONLY, 0)
 	if err != nil {
 		s.log <- fmt.Sprintf("os OpenFile: %s", err.Error())
@@ -151,13 +174,13 @@ func (s *State) chunkFetch(id int, client *http.Client, req *http.Request) {
 		return
 	}
 
-	// copy network data to the output file
+	// Copy network data to the output file
 	buffer := make([]byte, torBlock)
 	for {
 		n, err := resp.Body.Read(buffer)
 		if n > 0 {
 			file.Write(buffer[:n])
-			// enough to RLock(), as we only modify our own chunk
+			// Enough to RLock(), as we only modify our own chunk
 			s.rwmutex.RLock()
 			if int64(n) < s.chunks[id].length {
 				s.chunks[id].start += int64(n)
@@ -179,10 +202,7 @@ func (s *State) chunkFetch(id int, client *http.Client, req *http.Request) {
 }
 
 func (s *State) getExitNode(id int, client *http.Client) error {
-	req, err := http.NewRequest(http.MethodGet, "https://check.torproject.org/api/ip", nil)
-	if err != nil {
-		return fmt.Errorf("http NewRequest: %s", err.Error())
-	}
+	req, _ := http.NewRequest(http.MethodGet, "https://check.torproject.org/api/ip", nil)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -211,9 +231,9 @@ func (s *State) printLogs() {
 	for i := 0; i < n; i++ {
 		logs[i] = <-s.log
 	}
-	logs[n] = "stop" // not an expected log line
+	logs[n] = "stop" // Not an expected log line
 	sort.Strings(logs)
-	prevLog := "start" // not an expected log line
+	prevLog := "start" // Not an expected log line
 	cnt := 0
 	for _, log := range logs {
 		if log == prevLog {
@@ -238,10 +258,10 @@ func (s *State) ignoreLogs() {
 }
 
 func (s *State) statusLine() (status string) {
-	// calculate bytes transferred since the previous invocation
+	// Calculate bytes transferred since the previous invocation
 	curr := s.bytesTotal
 	s.rwmutex.RLock()
-	for id := 0; id < s.circuits; id++ {
+	for id := range s.circuits {
 		curr -= s.chunks[id].length
 	}
 	s.rwmutex.RUnlock()
@@ -251,19 +271,12 @@ func (s *State) statusLine() (status string) {
 			100*float32(curr)/float32(s.bytesTotal))
 	} else {
 		speed := float32(curr-s.bytesPrev) / 1000
-		prefix := "K"
-		if speed >= 1000 {
-			speed /= 1000
-			prefix = "M"
-		}
-		if speed >= 1000 {
-			speed /= 1000
-			prefix = "G"
-		}
+		humanSpeed := humanReadableSize(speed)
+
 		seconds := (s.bytesTotal - curr) / (curr - s.bytesPrev)
-		status = fmt.Sprintf("%6.2f%% done, %6.2f %sB/s, ETA %d:%02d:%02d",
+		status = fmt.Sprintf("%6.2f%% done, %s/s, ETA %d:%02d:%02d",
 			100*float32(curr)/float32(s.bytesTotal),
-			speed, prefix,
+			humanSpeed,
 			seconds/3600, seconds/60%60, seconds%60)
 	}
 
@@ -272,15 +285,12 @@ func (s *State) statusLine() (status string) {
 }
 
 func (s *State) progress() {
-	for {
-		time.Sleep(time.Second)
-		if s.verbose {
-			s.printLogs()
-		} else {
-			s.ignoreLogs()
-		}
-		s.printTemporary(s.statusLine())
+	if s.verbose {
+		s.printLogs()
+	} else {
+		s.ignoreLogs()
 	}
+	s.printTemporary(s.statusLine())
 }
 
 // Kill the worst performing circuit
@@ -290,7 +300,7 @@ func (s *State) darwin() {
 	now := time.Now()
 
 	s.rwmutex.RLock()
-	for id := 0; id < s.circuits; id++ {
+	for id := range s.circuits {
 		if s.chunks[id].cancel == nil {
 			continue
 		}
@@ -306,8 +316,6 @@ func (s *State) darwin() {
 		slowest = throughput
 	}
 	if victim >= 0 {
-		// fmt.Printf("killing %5.1fs %5.1fkB/s",
-		//	now.Sub(s.chunks[victim].since).Seconds(), slowest/1024.0)
 		s.chunks[victim].cancel()
 		s.chunks[victim].cancel = nil
 	}
@@ -330,12 +338,9 @@ func (s *State) getOutputFilepath() {
 	// If no -name argument provided, extract the filename from the URL
 	if name == "" {
 		srcUrl, _ := url.Parse(s.src) // We've already parsed the URL, ignore errors here
-		// if err != nil {
-		// 	fmt.Println(err.Error())
-		// 	return 1
-		// }
 		path := srcUrl.EscapedPath()
 		slash := strings.LastIndex(path, "/")
+
 		if slash >= 0 {
 			filename = path[slash+1:]
 		} else {
@@ -361,6 +366,7 @@ func (s *State) getOutputFilepath() {
 
 func (s *State) Fetch(src string) int {
 	s.src = src
+	startTime := time.Now()
 
 	s.getOutputFilepath()
 	// If the file already exists and the -force argument was not used, exit
@@ -374,7 +380,7 @@ func (s *State) Fetch(src string) int {
 	client := httpClient("torget")
 	resp, err := client.Head(s.src)
 	if err != nil {
-		fmt.Println(err.Error())
+		fmt.Printf("ERROR - Unable to connect to Tor proxy. Is it running?: %v\n", err)
 		return 1
 	}
 	if resp.ContentLength <= 0 {
@@ -382,7 +388,7 @@ func (s *State) Fetch(src string) int {
 		return 1
 	}
 	s.bytesTotal = resp.ContentLength
-	fmt.Println("Download length:", s.bytesTotal, "bytes")
+	fmt.Println("Download length:", humanReadableSize(float32(s.bytesTotal)))
 
 	// Create the output file. This will overwrite an existing file
 	file, err := os.Create(s.output)
@@ -397,7 +403,7 @@ func (s *State) Fetch(src string) int {
 	// Initialize chunks
 	chunkLen := s.bytesTotal / int64(s.circuits)
 	seq := 0
-	for id := 0; id < s.circuits; id++ {
+	for id := range s.circuits {
 		s.chunks[id].start = int64(id) * chunkLen
 		s.chunks[id].length = chunkLen
 		s.chunks[id].circuit = seq
@@ -405,13 +411,28 @@ func (s *State) Fetch(src string) int {
 	}
 	s.chunks[s.circuits-1].length += s.bytesTotal % int64(s.circuits)
 
-	// Spawn initial fetchers
-	go s.progress()
+	// Update status message every 1 second
+	stop_status := make(chan bool)
 	go func() {
-		for id := 0; id < s.circuits; id++ {
+		for {
+			time.Sleep(time.Second)
+
+			select {
+			case <-stop_status:
+				close(stop_status)
+				return
+			default:
+				s.progress()
+			}
+		}
+	}()
+
+	// Spawn initial fetchers
+	go func() {
+		for id := range s.circuits {
 			client, req := s.chunkInit(id)
 			go s.chunkFetch(id, client, req)
-			time.Sleep(499 * time.Millisecond) // be gentle to the local tor daemon
+			time.Sleep(499 * time.Millisecond) // Be gentle to the local tor daemon
 		}
 	}()
 
@@ -436,7 +457,9 @@ func (s *State) Fetch(src string) int {
 
 				if s.chunks[longest].length == 0 {
 					// All done
-					s.printPermanent("Download complete")
+					s.printPermanent(fmt.Sprintf("Download complete - %s", time.Since(startTime).Round(time.Second)))
+					stop_status <- true
+
 					return 0
 				}
 				if s.chunks[longest].length <= 5*torBlock {
@@ -465,6 +488,7 @@ var destination string
 var force bool
 var minLifetime int
 var name string
+var torPort int
 var verbose bool
 
 func init() {
@@ -484,29 +508,35 @@ func init() {
 	flag.StringVar(&name, "name", "", "Output filename.")
 	flag.StringVar(&name, "n", "", "Output filename.")
 
+	flag.IntVar(&torPort, "tor-port", 9050, "Port your Tor service is listening on.")
+	flag.IntVar(&torPort, "p", 9050, "Port your Tor service is listening on.")
+
 	flag.BoolVar(&verbose, "verbose", false, "Show iagnostic details.")
 	flag.BoolVar(&verbose, "v", false, "Show iagnostic details.")
 
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "torget 2.0, a fast large file downloader over locally installed Tor")
-		fmt.Fprintln(os.Stderr, "Copyright © 2021-2023 Michał Trojnara <Michal.Trojnara@stunnel.org>")
-		fmt.Fprintln(os.Stderr, "Licensed under GNU/GPL version 3")
-		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, "Usage: torget [FLAGS] {file.txt | URL [URL2...]}")
+		w := flag.CommandLine.Output()
+
+		fmt.Fprintln(w, "torget 2.0, a fast large file downloader over locally installed Tor")
+		fmt.Fprintln(w, "Copyright © 2021-2023 Michał Trojnara <Michal.Trojnara@stunnel.org>")
+		fmt.Fprintln(w, "Licensed under GNU GPL version 3 <https://www.gnu.org/licenses/>")
+		fmt.Fprintln(w, "\nUsage: torget [FLAGS] {file.txt | URL [URL2...]}")
 
 		// Custom print out of the arguments to avoid duplicate entries for long and short versions
-		fmt.Fprintln(os.Stderr, "  -circuits, -c int")
-		fmt.Fprintln(os.Stderr, "        Concurrent circuits. (default 20)")
-		fmt.Fprintln(os.Stderr, "  -destination, -d string")
-		fmt.Fprintln(os.Stderr, "        Output directory. (default current directory)")
-		fmt.Fprintln(os.Stderr, "  -force bool")
-		fmt.Fprintln(os.Stderr, "        Will create parent folder(s) and/or overwrite existing files.")
-		fmt.Fprintln(os.Stderr, "  -min-lifetime, -l int")
-		fmt.Fprintln(os.Stderr, "        Minimum circuit lifetime (seconds). (default 10)")
-		fmt.Fprintln(os.Stderr, "  -name, -n string")
-		fmt.Fprintln(os.Stderr, "        Output filename. (default filename from URL)")
-		fmt.Fprintln(os.Stderr, "  -verbose, -v")
-		fmt.Fprintln(os.Stderr, "        Show diagnostic details.")
+		fmt.Fprintln(w, "  -circuits, -c int")
+		fmt.Fprintln(w, "        Concurrent circuits. (default 20)")
+		fmt.Fprintln(w, "  -destination, -d string")
+		fmt.Fprintln(w, "        Output directory. (default current directory)")
+		fmt.Fprintln(w, "  -force bool")
+		fmt.Fprintln(w, "        Will create parent folder(s) and/or overwrite existing files.")
+		fmt.Fprintln(w, "  -min-lifetime, -l int")
+		fmt.Fprintln(w, "        Minimum circuit lifetime (seconds). (default 10)")
+		fmt.Fprintln(w, "  -name, -n string")
+		fmt.Fprintln(w, "        Output filename. (default filename from URL)")
+		fmt.Fprintln(w, "  -tor-port, -p int")
+		fmt.Fprintln(w, "        Port your Tor service is listening on. (default 9050)")
+		fmt.Fprintln(w, "  -verbose, -v")
+		fmt.Fprintln(w, "        Show diagnostic details.")
 	}
 }
 
@@ -559,7 +589,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx := context.Background()
+	bkgr := context.Background()
 
 	// Iterate over each URL passed as an argument and download the file
 	for i, uri := range uris {
@@ -569,13 +599,12 @@ func main() {
 			continue
 		}
 
-		if len(uris) < 1 {
+		if len(uris) > 1 {
 			fmt.Printf("\n[%d/%d] - %s\n", i+1, len(uris), uri)
 		}
 
+		ctx := context.WithoutCancel(bkgr)
 		state := NewState(ctx)
 		state.Fetch(uri)
 	}
 }
-
-// vim: noet:ts=4:sw=4:sts=4:spell

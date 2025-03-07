@@ -22,7 +22,7 @@ Onion services are fully supported.
     $ ./torget -h
     torget 2.0, a fast large file downloader over locally installed Tor
     Copyright © 2021-2023 Michał Trojnara <Michal.Trojnara@stunnel.org>
-    Licensed under GNU/GPL version 3
+    Licensed under GNU GPL version 3 <https://www.gnu.org/licenses/>
 
     Usage: torget [FLAGS] {file.txt | URL [URL2...]}
       -circuits, -c int
@@ -35,6 +35,8 @@ Onion services are fully supported.
             Minimum circuit lifetime (seconds). (default 10)
       -name, -n string
             Output filename. (default filename from URL)
+      -tor-port, -p int
+            Port your Tor service is listening on. (default 9050)
       -verbose, -v
             Show diagnostic details.
 

@@ -7,7 +7,7 @@ resulting in much faster downloads. Onion services are fully supported.
 
 tor-dl is based on the work-in-progress 2.0 version of
 [torget by Michał Trojnara](https://github.com/mtrojnar/torget). The two most
-impactful are:
+impactful updates are:
 
 - Specify download destination folders and/or filenames
 - Download multiple files

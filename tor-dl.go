@@ -1,8 +1,10 @@
 package main
 
 /*
-	torget is a fast large file downloader over locally installed Tor
-	Copyright © 2021-2023 Michał Trojnara <Michal.Trojnara@stunnel.org>
+	tor-dl - fast large file downloader over locally installed Tor
+	Copyright © 2025 Bryan Cuneo <https://github.com/BryanCuneo/tor-dl/>
+
+	Based on torget by Michał Trojnara <https://github.com/mtrojnar/torget>
 
 	This program is free software: you can redistribute it and/or modify
 	it under the terms of the GNU General Public License as published by
@@ -377,7 +379,7 @@ func (s *State) Fetch(src string) int {
 	fmt.Println("Output file:", s.output)
 
 	// Get the target length
-	client := httpClient("torget")
+	client := httpClient("tordl")
 	resp, err := client.Head(s.src)
 	if err != nil {
 		fmt.Printf("ERROR - Unable to connect to Tor proxy. Is it running?: %v\n", err)
@@ -457,7 +459,7 @@ func (s *State) Fetch(src string) int {
 
 				if s.chunks[longest].length == 0 {
 					// All done
-					s.printPermanent(fmt.Sprintf("Download complete - %s", time.Since(startTime).Round(time.Second)))
+					s.printPermanent(fmt.Sprintf("Download completed in %s", time.Since(startTime).Round(time.Second)))
 					stop_status <- true
 
 					return 0
@@ -516,27 +518,28 @@ func init() {
 
 	flag.Usage = func() {
 		w := flag.CommandLine.Output()
+		msg := `tor-dl -  fast large file downloader over locally installed Tor
+Copyright © 2025 Bryan Cuneo <https://github.com/BryanCuneo/tor-dl/>
+Licensed under GNU GPL version 3 <https://www.gnu.org/licenses/>
+Based on torget by Michał Trojnara <https://github.com/mtrojnar/torget>
 
-		fmt.Fprintln(w, "torget 2.0, a fast large file downloader over locally installed Tor")
-		fmt.Fprintln(w, "Copyright © 2021-2023 Michał Trojnara <Michal.Trojnara@stunnel.org>")
-		fmt.Fprintln(w, "Licensed under GNU GPL version 3 <https://www.gnu.org/licenses/>")
-		fmt.Fprintln(w, "\nUsage: torget [FLAGS] {file.txt | URL [URL2...]}")
+Usage: tor-dl [FLAGS] {file.txt | URL [URL2...]}
+  -circuits, -c int
+        Concurrent circuits. (default 20)
+  -destination, -d string
+        Output directory. (default current directory)
+  -force bool
+        Will create parent folder(s) and/or overwrite existing files.
+  -min-lifetime, -l int
+        Minimum circuit lifetime (seconds). (default 10)
+  -name, -n string
+        Output filename. (default filename from URL)
+  -tor-port, -p int
+        Port your Tor service is listening on. (default 9050)
+  -verbose, -v
+        Show diagnostic details.`
 
-		// Custom print out of the arguments to avoid duplicate entries for long and short versions
-		fmt.Fprintln(w, "  -circuits, -c int")
-		fmt.Fprintln(w, "        Concurrent circuits. (default 20)")
-		fmt.Fprintln(w, "  -destination, -d string")
-		fmt.Fprintln(w, "        Output directory. (default current directory)")
-		fmt.Fprintln(w, "  -force bool")
-		fmt.Fprintln(w, "        Will create parent folder(s) and/or overwrite existing files.")
-		fmt.Fprintln(w, "  -min-lifetime, -l int")
-		fmt.Fprintln(w, "        Minimum circuit lifetime (seconds). (default 10)")
-		fmt.Fprintln(w, "  -name, -n string")
-		fmt.Fprintln(w, "        Output filename. (default filename from URL)")
-		fmt.Fprintln(w, "  -tor-port, -p int")
-		fmt.Fprintln(w, "        Port your Tor service is listening on. (default 9050)")
-		fmt.Fprintln(w, "  -verbose, -v")
-		fmt.Fprintln(w, "        Show diagnostic details.")
+		fmt.Fprintln(w, msg)
 	}
 }
 

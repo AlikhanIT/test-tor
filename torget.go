@@ -64,7 +64,7 @@ const torBlock = 8000 // The longest plain text block in Tor
 
 // Basic function to determine human-readable file sizes
 func humanReadableSize(sizeInBytes float32) string {
-	units := []string{"B", "KB", "MB", "GB", "TB"}
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}
 	i := 0
 
 	for {

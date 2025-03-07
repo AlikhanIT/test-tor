@@ -43,28 +43,27 @@ Onion services are fully supported.
 ### Download a file to the current directory
     $ ./torget "https://archive.org/download/grimaces-birthday-game/Grimace%27s%20Birthday%20%28World%29%20%28v1.7%29%20%28Aftermarket%29%20%28Unl%29.gbc"
     Output file: Grimace's Birthday (World) (v1.7) (Aftermarket) (Unl).gbc
-    Download length: 1048576 bytes
-    Download complete
+    Download length:   1.00 MiB
+    Download complete - 20s
 
 ### Specify a destination directory
     $ ./torget -destination "/isos" "https://cdimage.ubuntu.com/kubuntu/releases/24.10/release/kubuntu-24.10-desktop-amd64.iso"
-    Output file: /isos/kubuntu-24.10-desktop-amd64.iso
-    Download length: 4678961152 bytes
-    Download complete
+    Output file: /isos/kubuntu-24.10-desktop-amd64.isoDownload length:   4.36 GiB
+    Download complete - 5m43s
 
 ### Specify a new name for the file
     $ ./torget -name "haiku-beta5-x86.iso" "https://mirrors.rit.edu/haiku/r1beta5/haiku-r1beta5-x86_gcc2h-anyboot.iso"
     Output file: haiku-beta5-x86.iso
-    Download length: 1477246976 bytes
-    Download complete
+    Download length:   1.38 GiB
+    Download complete - 1m47s
 
 ### The -force flag
 Use the -force flag to create parent directories and/or overwrite existing files
 
     $ ./torget -force -destination "/movies/Big Buck Bunny - Sunflower version (2013)" -name "Big Buck Bunny - Sunflower Version (2013).mp4" "http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_native_60fps_normal.mp4"
     Output file: /movies/Big Buck Bunny - Sunflower version (2013)/Big Buck Bunny - Sunflower Version (2013).mp4
-    Download length: 831871244 bytes
-    Download complete
+    Download length: 793.33 MiB
+    Download complete - 2m52s
 
 If the destination directory is not found, the program will try downloading to the current directory instead.
 
@@ -86,18 +85,18 @@ You may pass more than one URL to torget and download them all sequentially.
 
     [1/3] - https://archive.org/download/ca200_cjazz/ca200_Various__Clinical_Jazz_CD1.zip
     Output file: /music/ca200_Various__Clinical_Jazz_CD1.zip
-    Download length: 177206596 bytes
-    Download complete
+    Download length: 169.00 MiB
+    Download complete - 1m16s
     
     [2/3] - https://archive.org/download/ca200_cjazz/ca200_Various__Clinical_Jazz_CD2v.zip
     Output file: /music/ca200_Various__Clinical_Jazz_CD2v.zip
-    Download length: 142228026 bytes
-    Download complete
+    Download length: 135.64 MiB
+    Download complete - 1m5s
     
     [3/3] - https://archive.org/download/ca200_cjazz/ca200_Various__Clinical_Jazz_CD3.zip
     Output file: /music/ca200_Various__Clinical_Jazz_CD3.zip
-    Download length: 152713364 bytes
-    Download complete
+    Download length: 145.64 MiB
+    Download complete - 1m15s
 
 ### With a local text file
 You may pass the path of a text file containing multiple URLs on each line to download them all sequentially.
@@ -115,15 +114,15 @@ You may pass the path of a text file containing multiple URLs on each line to do
 
     [1/3] - https://archive.org/download/ca200_cjazz/ca200_Various__Clinical_Jazz_CD4.zip
     Output file: /music/ca200_Various__Clinical_Jazz_CD4.zip
-    Download length: 163400499 bytes
-    Download complete
+    Download length: 155.83 MiB
+    Download complete - 1m13s
     
     [2/3] - https://archive.org/download/ca200_cjazz/ca200_Various__Clinical_Jazz_CD5.zip
     Output file: /music/ca200_Various__Clinical_Jazz_CD5.zip
-    Download length: 160286763 bytes
-    Download complete
+    Download length: 152.86 MiB
+    Download complete - 1m4s
     
     [3/3] - https://archive.org/download/ca200_cjazz/ca200_Various__Clinical_Jazz_CD6.zip
     Output file: /music/ca200_Various__Clinical_Jazz_CD6.zip
-    Download length: 166744974 bytes
-    Download complete
+    Download length: 159.02 MiB
+    Download complete - 1m9s

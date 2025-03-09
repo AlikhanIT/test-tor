@@ -23,12 +23,14 @@ impactful updates are:
 
 ### View help page
     $ ./tor-dl -h
-    tor-dl -  fast large file downloader over locally installed Tor
+    tor-dl - fast large file downloader over locally installed Tor
     Copyright © 2025 Bryan Cuneo <https://github.com/BryanCuneo/tor-dl/>
     Based on torget by Michał Trojnara <https://github.com/mtrojnar/torget>
     Licensed under GNU GPL version 3 <https://www.gnu.org/licenses/>
 
     Usage: tor-dl [FLAGS] {file.txt | URL [URL2...]}
+      -allow-http bool
+            Allow tor-dl to download files over HTTP instead of HTTPS. Not recommended!
       -circuits, -c int
             Concurrent circuits. (default 20)
       -destination, -d string
@@ -130,3 +132,27 @@ You may pass the path of a text file containing multiple URLs on each line to do
     Output file: /music/ca200_Various__Clinical_Jazz_CD6.zip
     Download length: 159.02 MiB
     Download completed in 1m9s
+
+# A Note on Privacy
+Neither this tool nor Tor in general guarantees anonymity. Please review
+[this blog post](https://support.torproject.org/faq/staying-anonymous/) from
+the Tor Project for tips on protectecting yourself. Especially relevant to
+tor-dl is the section titled, "Don't open documents downloaded through Tor
+while online." tor-dl is primarily designed for the use case of evading
+network restrictions by routing your traffic through Tor. But it will have no
+impact on how you use the files after they've been downoloaded.
+
+## Downloads over HTTP
+By default, tor-dl will not allow you to download files over HTTP:
+
+    $ ./tor-dl http://archive.org/download/dracula_librivox/DraculaStoker_64kb_librivox.m4b
+    ERROR: "http://archive.org/download/dracula_librivox/DraculaStoker_64kb_librivox.m4b" is not using HTTPS.
+        If you absolutely must use HTTP, use the -allow-http flag. This is dangerous and not recommended!
+
+If you understand the privacy concerns and still want to download over HTTP
+anyway, you can use the `-allow-http` flag:
+
+    $ ./tor-dl -allow-http http://archive.org/download/dracula_librivox/DraculaStoker_64kb_librivox.m4b
+    Output file: DraculaStoker_64kb_librivox.m4b
+    Download length: 594.70 MiB
+    Download completed in 3m44s

@@ -333,7 +333,7 @@ func (s *State) getOutputFilepath() {
 			os.MkdirAll(destination, os.ModePerm)
 		} else {
 			fmt.Printf("WARNING: Unable to find destination \"%s\".\nTrying current directory instead.\n", destination)
-			destination = ""
+			destination = "."
 		}
 	}
 
@@ -485,6 +485,7 @@ func (s *State) Fetch(src string) int {
 	}
 }
 
+var allowHttp bool
 var circuits int
 var destination string
 var force bool
@@ -495,13 +496,14 @@ var verbose bool
 
 func init() {
 	// Set up CLI arguments
+	flag.BoolVar(&allowHttp, "allow-http", false, "Allow tor-dl to download files over HTTP instead of HTTPS. Not recommended!")
+
 	flag.IntVar(&circuits, "circuits", 20, "Concurrent circuits.")
 	flag.IntVar(&circuits, "c", 20, "Concurrent circuits.")
 
-	flag.StringVar(&destination, "destination", "", "Output directory.")
-	flag.StringVar(&destination, "d", "", "Output directory.")
+	flag.StringVar(&destination, "destination", ".", "Output directory.")
+	flag.StringVar(&destination, "d", ".", "Output directory.")
 
-	// No short version of force since it is a comparatively dangerous flag
 	flag.BoolVar(&force, "force", false, "Will create parent folder(s) and/or overwrite existing files.")
 
 	flag.IntVar(&minLifetime, "min-lifetime", 10, "Minimum circuit lifetime. (seconds)")
@@ -518,12 +520,14 @@ func init() {
 
 	flag.Usage = func() {
 		w := flag.CommandLine.Output()
-		msg := `tor-dl -  fast large file downloader over locally installed Tor
+		msg := `tor-dl - fast large file downloader over locally installed Tor
 Copyright © 2025 Bryan Cuneo <https://github.com/BryanCuneo/tor-dl/>
 Licensed under GNU GPL version 3 <https://www.gnu.org/licenses/>
 Based on torget by Michał Trojnara <https://github.com/mtrojnar/torget>
 
 Usage: tor-dl [FLAGS] {file.txt | URL [URL2...]}
+  -allow-http bool
+        Allow tor-dl to download files over HTTP instead of HTTPS. Not recommended!
   -circuits, -c int
         Concurrent circuits. (default 20)
   -destination, -d string
@@ -559,6 +563,7 @@ func main() {
 			file, err := os.Open(flag.Arg(0))
 			if err != nil {
 				fmt.Printf("ERROR: argument \"%s\" is not a valid URL or file.\n%v\n", flag.Arg(0), err)
+				os.Exit(1)
 			}
 			defer file.Close()
 
@@ -596,7 +601,7 @@ func main() {
 
 	// Iterate over each URL passed as an argument and download the file
 	for i, uri := range uris {
-		_, err := url.ParseRequestURI(uri)
+		u, err := url.ParseRequestURI(uri)
 		if err != nil {
 			fmt.Printf("ERROR: \"%s\" is not a valid URL.\n", uri)
 			continue
@@ -604,6 +609,11 @@ func main() {
 
 		if len(uris) > 1 {
 			fmt.Printf("\n[%d/%d] - %s\n", i+1, len(uris), uri)
+		}
+
+		if !allowHttp && u.Scheme != "https" {
+			fmt.Printf("ERROR: \"%s\" is not using HTTPS.\n\tIf you absolutely must use HTTP, use the -allow-http flag. This is dangerous and not recommended!\n", uri)
+			continue
 		}
 
 		ctx := context.WithoutCancel(bkgr)

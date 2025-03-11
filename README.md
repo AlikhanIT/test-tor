@@ -76,8 +76,8 @@ will see the following error:
     ERROR: "/audiobooks/DraculaStoker_64kb_librivox.m4b" already exists. Skipping.
 
 If instead a directory in your `-destination` path doesn't exist, you
-you will get a warning the download will default to your current directory
-instead:
+you will get a warning and the download will default to your current
+directory instead:
 
     $ tor-dl -destination "/audiobooks/" "https://archive.org/download/dracula_librivox/DraculaStoker_64kb_librivox.m4b"      
     WARNING: Unable to find destination "/audiobooks/". Trying current directory instead.
@@ -85,7 +85,8 @@ instead:
     Download length: 594.70 MiB
     Download completed in 2m18s
 
-To automatically create new drectories and/or overwrite existing files, you can use the `-force` flag:
+To automatically create new drectories and/or overwrite existing files, you
+can use the `-force` flag:
 
     $ tor-dl -force -destination "/audiobooks/" "https://archive.org/download/dracula_librivox/DraculaStoker_64kb_librivox.m4b"      
     Output file: /audiobooks/DraculaStoker_64kb_librivox.m4b
@@ -116,7 +117,8 @@ You may pass more than one URL to tor-dl and download them all sequentially.
     Download completed in 1m15s
 
 ### With a local text file
-You may pass the path of a text file containing multiple URLs on each line to download them all sequentially.
+You may pass the path of a text file containing multiple URLs on each line to
+download them all sequentially.
 
 #### /music/downloads.txt
     

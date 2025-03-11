@@ -367,6 +367,7 @@ func (s *State) getOutputFilepath() {
 }
 
 func (s *State) Fetch(src string) int {
+	var stop_status chan bool
 	s.src = src
 	startTime := time.Now()
 
@@ -413,21 +414,23 @@ func (s *State) Fetch(src string) int {
 	}
 	s.chunks[s.circuits-1].length += s.bytesTotal % int64(s.circuits)
 
-	// Update status message every 1 second
-	stop_status := make(chan bool)
-	go func() {
-		for {
-			time.Sleep(time.Second)
+	// If not -quiet or -silent, update status message every 1 second
+	if !quiet && !silent {
+		stop_status = make(chan bool)
+		go func() {
+			for {
+				time.Sleep(time.Second)
 
-			select {
-			case <-stop_status:
-				close(stop_status)
-				return
-			default:
-				s.progress()
+				select {
+				case <-stop_status:
+					close(stop_status)
+					return
+				default:
+					s.progress()
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	// Spawn initial fetchers
 	go func() {
@@ -529,6 +532,7 @@ func init() {
 	flag.BoolVar(&verbose, "verbose", false, "Show iagnostic details.")
 	flag.BoolVar(&verbose, "v", false, "Show iagnostic details.")
 
+	// Custom usage message to avoid duplicate entries for long & short flags
 	flag.Usage = func() {
 		w := flag.CommandLine.Output()
 		msg := `tor-dl - fast large file downloader over locally installed Tor
@@ -566,7 +570,7 @@ func main() {
 	flag.Parse()
 	if flag.NArg() < 1 {
 		flag.Usage()
-		os.Exit(1)
+		os.Exit(0)
 	}
 
 	// If the -quiet or -silent argument was used, don't print non-error text
@@ -617,7 +621,7 @@ func main() {
 
 		// Ignore the -name argument when multiple files are provided, just use the URL's filename
 		if name != "" {
-			fmt.Fprintln(messageWriter, "The -name argument is not usable when multiple URLs are provided. Ignoring.")
+			fmt.Fprintln(messageWriter, "WARNING: The -name argument is not usable when multiple URLs are provided. Ignoring.")
 			name = ""
 		}
 	} else if len(uris) < 1 {

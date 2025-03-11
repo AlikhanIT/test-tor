@@ -19,7 +19,7 @@ impactful updates are:
     $ cd tor-dl
     $ go build tor-dl.go
 
-## Using
+## Usage
 
 ### View help page
     $ ./tor-dl -h
@@ -68,22 +68,29 @@ impactful updates are:
     Download completed in 1m47s
 
 ### The -force flag
-Use the -force flag to create parent directories and/or overwrite existing files
+By default, tor-dl will not create any parent directories or overwrite
+existing files. If the file already exists in your destination, then you
+will see the following error:
 
-    $ ./tor-dl -force -destination "/movies/Big Buck Bunny - Sunflower version (2013)" -name "Big Buck Bunny - Sunflower Version (2013).mp4" "http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_native_60fps_normal.mp4"
-    Output file: /movies/Big Buck Bunny - Sunflower version (2013)/Big Buck Bunny - Sunflower Version (2013).mp4
-    Download length: 793.33 MiB
-    Download completed in 2m52s
+    $ tor-dl -destination "/audiobooks/" "https://archive.org/download/dracula_librivox/DraculaStoker_64kb_librivox.m4b"                                   
+    ERROR: "/audiobooks/DraculaStoker_64kb_librivox.m4b" already exists. Skipping.
 
-If the destination directory is not found, the program will try downloading to the current directory instead.
+If instead a directory in your `-destination` path doesn't exist, you
+you will get a warning the download will default to your current directory
+instead:
 
-    WARNING: Unable to find destination "/movies/Big Buck Bunny - Sunflower version (2013)".
-    Trying current directory instead.
+    $ tor-dl -destination "/audiobooks/" "https://archive.org/download/dracula_librivox/DraculaStoker_64kb_librivox.m4b"      
+    WARNING: Unable to find destination "/audiobooks/". Trying current directory instead.
+    Output file: DraculaStoker_64kb_librivox.m4b
+    Download length: 594.70 MiB
+    Download completed in 2m18s
 
-If the file already exists, you will receive an error.
+To automatically create new drectories and/or overwrite existing files, you can use the `-force` flag:
 
-    ERROR: "/movies/Big Buck Bunny - Sunflower version (2013)/Big Buck Bunny - Sunflower Version (2013).mp4" already exists.
-    exit status 1
+    $ tor-dl -force -destination "/audiobooks/" "https://archive.org/download/dracula_librivox/DraculaStoker_64kb_librivox.m4b"      
+    Output file: /audiobooks/DraculaStoker_64kb_librivox.m4b
+    Download length: 594.70 MiB
+    Download completed in 2m18s
 
 ## Downloading Multiple Files
 
@@ -143,20 +150,20 @@ Neither this tool nor Tor in general guarantees anonymity. Please review
 the Tor Project for tips on protectecting yourself. Especially relevant to
 tor-dl is the section titled, "Don't open documents downloaded through Tor
 while online." tor-dl is primarily designed for the use case of evading
-network restrictions by routing your traffic through Tor. But it will have no
+network restrictions by routing your traffic through Tor and it will have no
 impact on how you use the files after they've been downoloaded.
 
 ## Downloads over HTTP
 By default, tor-dl will not allow you to download files over HTTP:
 
-    $ ./tor-dl http://archive.org/download/dracula_librivox/DraculaStoker_64kb_librivox.m4b
-    ERROR: "http://archive.org/download/dracula_librivox/DraculaStoker_64kb_librivox.m4b" is not using HTTPS.
-        If you absolutely must use HTTP, use the -allow-http flag. This is dangerous and not recommended!
+    $ ./tor-dl "http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_native_60fps_normal.mp4"
+    ERROR: "http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_native_60fps_normal.mp4" is not using HTTPS.
+    	If you absolutely must use HTTP, use the -allow-http flag. This is dangerous and not recommended!
 
 If you understand the privacy concerns and still want to download over HTTP
 anyway, you can use the `-allow-http` flag:
 
-    $ ./tor-dl -allow-http http://archive.org/download/dracula_librivox/DraculaStoker_64kb_librivox.m4b
-    Output file: DraculaStoker_64kb_librivox.m4b
-    Download length: 594.70 MiB
-    Download completed in 3m44s
+    $ ./tor-dl -allow-http "http://distribution.bbb3d.renderfarming.net/video/mp4/bbb_sunflower_native_60fps_normal.mp4"
+    Output file: bbb_sunflower_native_60fps_normal.mp4
+    Download length: 793.33 MiB
+    Download completed in 2m52s

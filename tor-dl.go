@@ -332,7 +332,7 @@ func (s *State) getOutputFilepath() {
 		if force {
 			os.MkdirAll(destination, os.ModePerm)
 		} else {
-			fmt.Fprintf(messageWriter, "WARNING: Unable to find destination \"%s\".\nTrying current directory instead.\n", destination)
+			fmt.Fprintf(messageWriter, "WARNING: Unable to find destination \"%s\". Trying current directory instead.\n", destination)
 			destination = "."
 		}
 	}

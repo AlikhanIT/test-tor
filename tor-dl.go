@@ -84,7 +84,7 @@ func humanReadableSize(sizeInBytes float32) string {
 func httpClient(user string) *http.Client {
 	proxyUrl, err := url.Parse(fmt.Sprintf("socks5://%s:%s@127.0.0.1:%d/", user, user, torPort))
 	if err != nil {
-		fmt.Printf("ERROR - Failed to parse URL with user '%s' and port '%d'\n%v", user, torPort, err)
+		fmt.Fprintf(errorWriter, "ERROR - Failed to parse URL with user '%s' and port '%d'\n%v", user, torPort, err)
 		os.Exit(1)
 	}
 
@@ -111,15 +111,15 @@ func NewState(ctx context.Context) *State {
 
 func (s *State) printPermanent(txt string) {
 	if s.terminal {
-		fmt.Printf("\r%-40s\n", txt)
+		fmt.Fprintf(messageWriter, "\r%-40s\n", txt)
 	} else {
-		fmt.Println(txt)
+		fmt.Fprintln(messageWriter, txt)
 	}
 }
 
 func (s *State) printTemporary(txt string) {
 	if s.terminal {
-		fmt.Printf("\r%-40s", txt)
+		fmt.Fprintf(messageWriter, "\r%-40s", txt)
 	}
 }
 
@@ -332,7 +332,7 @@ func (s *State) getOutputFilepath() {
 		if force {
 			os.MkdirAll(destination, os.ModePerm)
 		} else {
-			fmt.Printf("WARNING: Unable to find destination \"%s\".\nTrying current directory instead.\n", destination)
+			fmt.Fprintf(messageWriter, "WARNING: Unable to find destination \"%s\".\nTrying current directory instead.\n", destination)
 			destination = "."
 		}
 	}
@@ -355,7 +355,7 @@ func (s *State) getOutputFilepath() {
 		// Remove URL formatting (e.g. "%20" -> " ", "%C3" -> "ö")
 		decoded, err := url.QueryUnescape(filename)
 		if err != nil {
-			fmt.Printf("WARNING: Cannot decode \"%s\" - %v\n", filename, err)
+			fmt.Fprintf(messageWriter, "WARNING: Cannot decode \"%s\" - %v\n", filename, err)
 		} else {
 			filename = decoded
 		}
@@ -373,24 +373,24 @@ func (s *State) Fetch(src string) int {
 	s.getOutputFilepath()
 	// If the file already exists and the -force argument was not used, exit
 	if _, err := os.Stat(s.output); err == nil && !force {
-		fmt.Printf("ERROR: \"%s\" already exists. Skipping.\n", s.output)
+		fmt.Fprintf(errorWriter, "ERROR: \"%s\" already exists. Skipping.\n", s.output)
 		return 1
 	}
-	fmt.Println("Output file:", s.output)
+	fmt.Fprintln(messageWriter, "Output file:", s.output)
 
 	// Get the target length
 	client := httpClient("tordl")
 	resp, err := client.Head(s.src)
 	if err != nil {
-		fmt.Printf("ERROR - Unable to connect to Tor proxy. Is it running?: %v\n", err)
+		fmt.Fprintf(errorWriter, "ERROR - Unable to connect to Tor proxy. Is it running?: %v\n", err)
 		return 1
 	}
 	if resp.ContentLength <= 0 {
-		fmt.Println("Failed to retrieve download length")
+		fmt.Fprintln(errorWriter, "ERROR - Failed to retrieve download length")
 		return 1
 	}
 	s.bytesTotal = resp.ContentLength
-	fmt.Println("Download length:", humanReadableSize(float32(s.bytesTotal)))
+	fmt.Fprintln(messageWriter, "Download length:", humanReadableSize(float32(s.bytesTotal)))
 
 	// Create the output file. This will overwrite an existing file
 	file, err := os.Create(s.output)
@@ -398,7 +398,7 @@ func (s *State) Fetch(src string) int {
 		file.Close()
 	}
 	if err != nil {
-		fmt.Println(err.Error())
+		fmt.Fprintln(messageWriter, err.Error())
 		return 1
 	}
 
@@ -491,8 +491,13 @@ var destination string
 var force bool
 var minLifetime int
 var name string
+var quiet bool
+var silent bool
 var torPort int
 var verbose bool
+
+var errorWriter io.Writer
+var messageWriter io.Writer
 
 func init() {
 	// Set up CLI arguments
@@ -511,6 +516,12 @@ func init() {
 
 	flag.StringVar(&name, "name", "", "Output filename.")
 	flag.StringVar(&name, "n", "", "Output filename.")
+
+	flag.BoolVar(&quiet, "quiet", false, "Suppress most text output (still show errors).")
+	flag.BoolVar(&quiet, "q", false, "Suppress most text output (still show errors).")
+
+	flag.BoolVar(&silent, "silent", false, "Suppress all text output (including errors).")
+	flag.BoolVar(&silent, "s", false, "Suppress all text output (including errors).")
 
 	flag.IntVar(&torPort, "tor-port", 9050, "Port your Tor service is listening on.")
 	flag.IntVar(&torPort, "p", 9050, "Port your Tor service is listening on.")
@@ -538,6 +549,10 @@ Usage: tor-dl [FLAGS] {file.txt | URL [URL2...]}
         Minimum circuit lifetime (seconds). (default 10)
   -name, -n string
         Output filename. (default filename from URL)
+  -quiet, -q bool
+        Suppress most text output (still show errors).
+  -silent, -s bool
+        Suppress all text output (including errors).
   -tor-port, -p int
         Port your Tor service is listening on. (default 9050)
   -verbose, -v
@@ -554,6 +569,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	// If the -quiet or -silent argument was used, don't print non-error text
+	if quiet || silent {
+		messageWriter = io.Discard
+	} else {
+		messageWriter = os.Stdout
+	}
+	// if -silent argument was used, also don't print errors
+	if silent {
+		errorWriter = io.Discard
+	} else {
+		errorWriter = os.Stderr
+	}
+
 	var uris []string
 
 	if flag.NArg() == 1 {
@@ -562,7 +590,7 @@ func main() {
 			// Found a file on disk, read URLs from it
 			file, err := os.Open(flag.Arg(0))
 			if err != nil {
-				fmt.Printf("ERROR: argument \"%s\" is not a valid URL or file.\n%v\n", flag.Arg(0), err)
+				fmt.Fprintf(errorWriter, "ERROR: argument \"%s\" is not a valid URL or file.\n%v\n", flag.Arg(0), err)
 				os.Exit(1)
 			}
 			defer file.Close()
@@ -585,15 +613,15 @@ func main() {
 	}
 
 	if len(uris) > 1 {
-		fmt.Printf("Downloading %d files.\n", len(uris))
+		fmt.Fprintf(messageWriter, "Downloading %d files.\n", len(uris))
 
 		// Ignore the -name argument when multiple files are provided, just use the URL's filename
 		if name != "" {
-			fmt.Println("The -name argument is not usable when multiple URLs are provided. Ignoring.")
+			fmt.Fprintln(messageWriter, "The -name argument is not usable when multiple URLs are provided. Ignoring.")
 			name = ""
 		}
 	} else if len(uris) < 1 {
-		fmt.Println("ERROR: No URLs found.")
+		fmt.Fprintln(errorWriter, "ERROR: No URLs found.")
 		os.Exit(1)
 	}
 
@@ -603,16 +631,16 @@ func main() {
 	for i, uri := range uris {
 		u, err := url.ParseRequestURI(uri)
 		if err != nil {
-			fmt.Printf("ERROR: \"%s\" is not a valid URL.\n", uri)
+			fmt.Fprintf(errorWriter, "ERROR: \"%s\" is not a valid URL.\n", uri)
 			continue
 		}
 
 		if len(uris) > 1 {
-			fmt.Printf("\n[%d/%d] - %s\n", i+1, len(uris), uri)
+			fmt.Fprintf(messageWriter, "\n[%d/%d] - %s\n", i+1, len(uris), uri)
 		}
 
 		if !allowHttp && u.Scheme != "https" {
-			fmt.Printf("ERROR: \"%s\" is not using HTTPS.\n\tIf you absolutely must use HTTP, use the -allow-http flag. This is dangerous and not recommended!\n", uri)
+			fmt.Fprintf(errorWriter, "ERROR: \"%s\" is not using HTTPS.\n\tIf you absolutely must use HTTP, use the -allow-http flag. This is dangerous and not recommended!\n", uri)
 			continue
 		}
 

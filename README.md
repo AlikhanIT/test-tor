@@ -25,8 +25,8 @@ impactful updates are:
     $ ./tor-dl -h
     tor-dl - fast large file downloader over locally installed Tor
     Copyright © 2025 Bryan Cuneo <https://github.com/BryanCuneo/tor-dl/>
-    Based on torget by Michał Trojnara <https://github.com/mtrojnar/torget>
     Licensed under GNU GPL version 3 <https://www.gnu.org/licenses/>
+    Based on torget by Michał Trojnara <https://github.com/mtrojnar/torget>
 
     Usage: tor-dl [FLAGS] {file.txt | URL [URL2...]}
       -allow-http bool
@@ -41,6 +41,10 @@ impactful updates are:
             Minimum circuit lifetime (seconds). (default 10)
       -name, -n string
             Output filename. (default filename from URL)
+      -quiet, -q bool
+            Suppress most text output (still show errors).
+      -silent, -s bool
+            Suppress all text output (including errors).
       -tor-port, -p int
             Port your Tor service is listening on. (default 9050)
       -verbose, -v

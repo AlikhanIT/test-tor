@@ -70,7 +70,7 @@ func humanReadableSize(sizeInBytes float32) string {
 	i := 0
 
 	for {
-		if sizeInBytes >= 1024 {
+		if sizeInBytes >= 1024 && i < len(units) {
 			sizeInBytes /= 1024
 			i += 1
 		} else {
@@ -78,13 +78,13 @@ func humanReadableSize(sizeInBytes float32) string {
 		}
 	}
 
-	return fmt.Sprintf("%6.2f %s", sizeInBytes, units[i])
+	return fmt.Sprintf("%.2f %s", sizeInBytes, units[i])
 }
 
 func httpClient(user string) *http.Client {
 	proxyUrl, err := url.Parse(fmt.Sprintf("socks5://%s:%s@127.0.0.1:%d/", user, user, torPort))
 	if err != nil {
-		fmt.Printf("ERROR - Failed to parse URL with user '%s' and port '%d'\n%v", user, torPort, err)
+		fmt.Fprintf(errorWriter, "ERROR - Failed to parse URL with user '%s' and port '%d'\n%v", user, torPort, err)
 		os.Exit(1)
 	}
 
@@ -111,15 +111,15 @@ func NewState(ctx context.Context) *State {
 
 func (s *State) printPermanent(txt string) {
 	if s.terminal {
-		fmt.Printf("\r%-40s\n", txt)
+		fmt.Fprintf(messageWriter, "\r%-40s\n", txt)
 	} else {
-		fmt.Println(txt)
+		fmt.Fprintln(messageWriter, txt)
 	}
 }
 
 func (s *State) printTemporary(txt string) {
 	if s.terminal {
-		fmt.Printf("\r%-40s", txt)
+		fmt.Fprintf(messageWriter, "\r%-40s", txt)
 	}
 }
 
@@ -261,7 +261,9 @@ func (s *State) ignoreLogs() {
 
 func (s *State) statusLine() (status string) {
 	// Calculate bytes transferred since the previous invocation
+	var progressMessage string
 	curr := s.bytesTotal
+
 	s.rwmutex.RLock()
 	for id := range s.circuits {
 		curr -= s.chunks[id].length
@@ -269,18 +271,15 @@ func (s *State) statusLine() (status string) {
 	s.rwmutex.RUnlock()
 
 	if curr == s.bytesPrev {
-		status = fmt.Sprintf("%6.2f%% done, stalled",
-			100*float32(curr)/float32(s.bytesTotal))
+		progressMessage = "stalled"
 	} else {
-		speed := float32(curr-s.bytesPrev) / 1000
-		humanSpeed := humanReadableSize(speed)
-
 		seconds := (s.bytesTotal - curr) / (curr - s.bytesPrev)
-		status = fmt.Sprintf("%6.2f%% done, %s/s, ETA %d:%02d:%02d",
-			100*float32(curr)/float32(s.bytesTotal),
-			humanSpeed,
+		progressMessage = fmt.Sprintf("%s/s, ETA %d:%02d:%02d",
+			humanReadableSize(float32(curr-s.bytesPrev)),
 			seconds/3600, seconds/60%60, seconds%60)
 	}
+	status = fmt.Sprintf("%6.2f%% done, %s",
+		100*float32(curr)/float32(s.bytesTotal), progressMessage)
 
 	s.bytesPrev = curr
 	return
@@ -332,8 +331,8 @@ func (s *State) getOutputFilepath() {
 		if force {
 			os.MkdirAll(destination, os.ModePerm)
 		} else {
-			fmt.Printf("WARNING: Unable to find destination \"%s\".\nTrying current directory instead.\n", destination)
-			destination = ""
+			fmt.Fprintf(messageWriter, "WARNING: Unable to find destination \"%s\". Trying current directory instead.\n", destination)
+			destination = "."
 		}
 	}
 
@@ -355,7 +354,7 @@ func (s *State) getOutputFilepath() {
 		// Remove URL formatting (e.g. "%20" -> " ", "%C3" -> "ö")
 		decoded, err := url.QueryUnescape(filename)
 		if err != nil {
-			fmt.Printf("WARNING: Cannot decode \"%s\" - %v\n", filename, err)
+			fmt.Fprintf(messageWriter, "WARNING: Cannot decode \"%s\" - %v\n", filename, err)
 		} else {
 			filename = decoded
 		}
@@ -367,30 +366,31 @@ func (s *State) getOutputFilepath() {
 }
 
 func (s *State) Fetch(src string) int {
+	var stop_status chan bool
 	s.src = src
 	startTime := time.Now()
 
 	s.getOutputFilepath()
 	// If the file already exists and the -force argument was not used, exit
 	if _, err := os.Stat(s.output); err == nil && !force {
-		fmt.Printf("ERROR: \"%s\" already exists. Skipping.\n", s.output)
+		fmt.Fprintf(errorWriter, "ERROR: \"%s\" already exists. Skipping.\n", s.output)
 		return 1
 	}
-	fmt.Println("Output file:", s.output)
+	fmt.Fprintf(messageWriter, "Output file:\t\t%s\n", s.output)
 
 	// Get the target length
 	client := httpClient("tordl")
 	resp, err := client.Head(s.src)
 	if err != nil {
-		fmt.Printf("ERROR - Unable to connect to Tor proxy. Is it running?: %v\n", err)
+		fmt.Fprintf(errorWriter, "ERROR - Unable to connect to Tor proxy. Is it running?: %v\n", err)
 		return 1
 	}
 	if resp.ContentLength <= 0 {
-		fmt.Println("Failed to retrieve download length")
+		fmt.Fprintln(errorWriter, "ERROR - Failed to retrieve download length")
 		return 1
 	}
 	s.bytesTotal = resp.ContentLength
-	fmt.Println("Download length:", humanReadableSize(float32(s.bytesTotal)))
+	fmt.Fprintf(messageWriter, "Download filesize:\t%s\n", humanReadableSize(float32(s.bytesTotal)))
 
 	// Create the output file. This will overwrite an existing file
 	file, err := os.Create(s.output)
@@ -398,7 +398,7 @@ func (s *State) Fetch(src string) int {
 		file.Close()
 	}
 	if err != nil {
-		fmt.Println(err.Error())
+		fmt.Fprintln(messageWriter, err.Error())
 		return 1
 	}
 
@@ -413,21 +413,23 @@ func (s *State) Fetch(src string) int {
 	}
 	s.chunks[s.circuits-1].length += s.bytesTotal % int64(s.circuits)
 
-	// Update status message every 1 second
-	stop_status := make(chan bool)
-	go func() {
-		for {
-			time.Sleep(time.Second)
+	// If not -quiet or -silent, update status message every 1 second
+	if !quiet && !silent {
+		stop_status = make(chan bool)
+		go func() {
+			for {
+				time.Sleep(time.Second)
 
-			select {
-			case <-stop_status:
-				close(stop_status)
-				return
-			default:
-				s.progress()
+				select {
+				case <-stop_status:
+					close(stop_status)
+					return
+				default:
+					s.progress()
+				}
 			}
-		}
-	}()
+		}()
+	}
 
 	// Spawn initial fetchers
 	go func() {
@@ -459,9 +461,17 @@ func (s *State) Fetch(src string) int {
 
 				if s.chunks[longest].length == 0 {
 					// All done
-					s.printPermanent(fmt.Sprintf("Download completed in %s", time.Since(startTime).Round(time.Second)))
-					stop_status <- true
+					howLong := time.Since(startTime)
+					averageSpeed := humanReadableSize(float32(s.bytesTotal) / float32(howLong.Seconds()))
 
+					// Clear progress, otherwise some text artifacts remain
+					s.printTemporary(strings.Repeat(" ", 42))
+
+					s.printPermanent(fmt.Sprintf("Download completed in:\t%s (%s/s)",
+						howLong.Round(time.Second),
+						averageSpeed))
+
+					stop_status <- true
 					return 0
 				}
 				if s.chunks[longest].length <= 5*torBlock {
@@ -485,23 +495,30 @@ func (s *State) Fetch(src string) int {
 	}
 }
 
+var allowHttp bool
 var circuits int
 var destination string
 var force bool
 var minLifetime int
 var name string
+var quiet bool
+var silent bool
 var torPort int
 var verbose bool
 
+var errorWriter io.Writer
+var messageWriter io.Writer
+
 func init() {
 	// Set up CLI arguments
+	flag.BoolVar(&allowHttp, "allow-http", false, "Allow tor-dl to download files over HTTP instead of HTTPS. Not recommended!")
+
 	flag.IntVar(&circuits, "circuits", 20, "Concurrent circuits.")
 	flag.IntVar(&circuits, "c", 20, "Concurrent circuits.")
 
-	flag.StringVar(&destination, "destination", "", "Output directory.")
-	flag.StringVar(&destination, "d", "", "Output directory.")
+	flag.StringVar(&destination, "destination", ".", "Output directory.")
+	flag.StringVar(&destination, "d", ".", "Output directory.")
 
-	// No short version of force since it is a comparatively dangerous flag
 	flag.BoolVar(&force, "force", false, "Will create parent folder(s) and/or overwrite existing files.")
 
 	flag.IntVar(&minLifetime, "min-lifetime", 10, "Minimum circuit lifetime. (seconds)")
@@ -510,20 +527,29 @@ func init() {
 	flag.StringVar(&name, "name", "", "Output filename.")
 	flag.StringVar(&name, "n", "", "Output filename.")
 
+	flag.BoolVar(&quiet, "quiet", false, "Suppress most text output (still show errors).")
+	flag.BoolVar(&quiet, "q", false, "Suppress most text output (still show errors).")
+
+	flag.BoolVar(&silent, "silent", false, "Suppress all text output (including errors).")
+	flag.BoolVar(&silent, "s", false, "Suppress all text output (including errors).")
+
 	flag.IntVar(&torPort, "tor-port", 9050, "Port your Tor service is listening on.")
 	flag.IntVar(&torPort, "p", 9050, "Port your Tor service is listening on.")
 
 	flag.BoolVar(&verbose, "verbose", false, "Show iagnostic details.")
 	flag.BoolVar(&verbose, "v", false, "Show iagnostic details.")
 
+	// Custom usage message to avoid duplicate entries for long & short flags
 	flag.Usage = func() {
 		w := flag.CommandLine.Output()
-		msg := `tor-dl -  fast large file downloader over locally installed Tor
+		msg := `tor-dl - fast large file downloader over locally installed Tor
 Copyright © 2025 Bryan Cuneo <https://github.com/BryanCuneo/tor-dl/>
 Licensed under GNU GPL version 3 <https://www.gnu.org/licenses/>
 Based on torget by Michał Trojnara <https://github.com/mtrojnar/torget>
 
 Usage: tor-dl [FLAGS] {file.txt | URL [URL2...]}
+  -allow-http bool
+        Allow tor-dl to download files over HTTP instead of HTTPS. Not recommended!
   -circuits, -c int
         Concurrent circuits. (default 20)
   -destination, -d string
@@ -534,6 +560,10 @@ Usage: tor-dl [FLAGS] {file.txt | URL [URL2...]}
         Minimum circuit lifetime (seconds). (default 10)
   -name, -n string
         Output filename. (default filename from URL)
+  -quiet, -q bool
+        Suppress most text output (still show errors).
+  -silent, -s bool
+        Suppress all text output (including errors).
   -tor-port, -p int
         Port your Tor service is listening on. (default 9050)
   -verbose, -v
@@ -547,7 +577,22 @@ func main() {
 	flag.Parse()
 	if flag.NArg() < 1 {
 		flag.Usage()
-		os.Exit(1)
+		os.Exit(0)
+	}
+
+	// If the -quiet or -silent argument was used, don't print non-error text
+	if quiet || silent {
+		messageWriter = io.Discard
+
+		// if -silent argument was used, also don't print errors
+		if silent {
+			errorWriter = io.Discard
+		} else {
+			errorWriter = os.Stderr
+		}
+	} else {
+		messageWriter = os.Stdout
+		errorWriter = os.Stderr
 	}
 
 	var uris []string
@@ -558,7 +603,8 @@ func main() {
 			// Found a file on disk, read URLs from it
 			file, err := os.Open(flag.Arg(0))
 			if err != nil {
-				fmt.Printf("ERROR: argument \"%s\" is not a valid URL or file.\n%v\n", flag.Arg(0), err)
+				fmt.Fprintf(errorWriter, "ERROR: argument \"%s\" is not a valid URL or file.\n%v\n", flag.Arg(0), err)
+				os.Exit(1)
 			}
 			defer file.Close()
 
@@ -580,15 +626,15 @@ func main() {
 	}
 
 	if len(uris) > 1 {
-		fmt.Printf("Downloading %d files.\n", len(uris))
+		fmt.Fprintf(messageWriter, "Downloading %d files.\n", len(uris))
 
 		// Ignore the -name argument when multiple files are provided, just use the URL's filename
 		if name != "" {
-			fmt.Println("The -name argument is not usable when multiple URLs are provided. Ignoring.")
+			fmt.Fprintln(messageWriter, "WARNING: The -name argument is not usable when multiple URLs are provided. Ignoring.")
 			name = ""
 		}
 	} else if len(uris) < 1 {
-		fmt.Println("ERROR: No URLs found.")
+		fmt.Fprintln(errorWriter, "ERROR: No URLs found.")
 		os.Exit(1)
 	}
 
@@ -596,14 +642,19 @@ func main() {
 
 	// Iterate over each URL passed as an argument and download the file
 	for i, uri := range uris {
-		_, err := url.ParseRequestURI(uri)
+		u, err := url.ParseRequestURI(uri)
 		if err != nil {
-			fmt.Printf("ERROR: \"%s\" is not a valid URL.\n", uri)
+			fmt.Fprintf(errorWriter, "ERROR: \"%s\" is not a valid URL.\n", uri)
 			continue
 		}
 
 		if len(uris) > 1 {
-			fmt.Printf("\n[%d/%d] - %s\n", i+1, len(uris), uri)
+			fmt.Fprintf(messageWriter, "\n[%d/%d] - %s\n", i+1, len(uris), uri)
+		}
+
+		if !allowHttp && u.Scheme != "https" {
+			fmt.Fprintf(errorWriter, "ERROR: \"%s\" is not using HTTPS.\n\tIf you absolutely must use HTTP, use the -allow-http flag. This is dangerous and not recommended!\n", uri)
+			continue
 		}
 
 		ctx := context.WithoutCancel(bkgr)

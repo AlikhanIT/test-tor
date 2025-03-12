@@ -6,11 +6,12 @@ parallel. With slow servers, this strategy bypasses per-IP traffic shaping,
 resulting in much faster downloads. Onion services are fully supported.
 
 tor-dl is based on the work-in-progress 2.0 version of
-[torget by Michał Trojnara](https://github.com/mtrojnar/torget). The two most
+[torget by Michał Trojnara](https://github.com/mtrojnar/torget). The most
 impactful updates are:
 
 - Specify download destination folders and/or filenames
 - Download multiple files
+- Improved text output (including the ability to suppress it)
 
 ## Building From Source
 

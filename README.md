@@ -12,6 +12,7 @@ impactful updates are:
 - Specify download destination folders and/or filenames
 - Download multiple files
 - Improved text output (including the ability to suppress it)
+- Safer default behavior (no overwriting files, no non-HTTPS downloads)
 
 ## Building From Source
 

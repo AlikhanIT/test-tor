@@ -1,3 +1,9 @@
+param(
+    [Parameter(Mandatory=$true)]
+    [string]
+    $Version
+)
+
 $OSes = @("windows", "linux", "freebsd", "openbsd", "netbsd", "darwin")
 $Env:GOARCH = "amd64"
 $executable = "./dist/tor-dl"
@@ -5,7 +11,7 @@ $win_executable = "./dist/tor-dl.exe"
 $license = "./LICENSE"
 $readme = "./README.md"
 
-New-Item -Path "./dist/" -ItemType Directory -ErrorAction SilentlyContinue | Out-Null
+New-Item -Path "./dist/$Version" -ItemType Directory -ErrorAction SilentlyContinue | Out-Null
 
 $OSes | ForEach-Object {
     Write-Host "Building for $_..." -NoNewline
@@ -21,7 +27,7 @@ $OSes | ForEach-Object {
     go build -o $out -ldflags "-w -s" ".\tor-dl.go"
 
     # Build zip archive with executable, license file, and readme file
-    $zip = "./dist/tor-dl-$_-$Env:GOARCH.zip"
+    $zip = "./dist/$Version/tor-dl-v$Version-$_-$Env:GOARCH.zip"
     Compress-Archive -Force -Path $out -DestinationPath $zip
     Compress-Archive -Update -Path $license -DestinationPath $zip
     Compress-Archive -Update -Path $readme -DestinationPath $zip 

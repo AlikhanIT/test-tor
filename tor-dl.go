@@ -70,7 +70,7 @@ func humanReadableSize(sizeInBytes float32) string {
 	i := 0
 
 	for {
-		if sizeInBytes >= 1024 {
+		if sizeInBytes >= 1024 && i < len(units) {
 			sizeInBytes /= 1024
 			i += 1
 		} else {
@@ -78,7 +78,7 @@ func humanReadableSize(sizeInBytes float32) string {
 		}
 	}
 
-	return fmt.Sprintf("%6.2f %s", sizeInBytes, units[i])
+	return fmt.Sprintf("%.2f %s", sizeInBytes, units[i])
 }
 
 func httpClient(user string) *http.Client {
@@ -261,7 +261,9 @@ func (s *State) ignoreLogs() {
 
 func (s *State) statusLine() (status string) {
 	// Calculate bytes transferred since the previous invocation
+	var progressMessage string
 	curr := s.bytesTotal
+
 	s.rwmutex.RLock()
 	for id := range s.circuits {
 		curr -= s.chunks[id].length
@@ -269,18 +271,15 @@ func (s *State) statusLine() (status string) {
 	s.rwmutex.RUnlock()
 
 	if curr == s.bytesPrev {
-		status = fmt.Sprintf("%6.2f%% done, stalled",
-			100*float32(curr)/float32(s.bytesTotal))
+		progressMessage = "stalled"
 	} else {
-		speed := float32(curr-s.bytesPrev) / 1000
-		humanSpeed := humanReadableSize(speed)
-
 		seconds := (s.bytesTotal - curr) / (curr - s.bytesPrev)
-		status = fmt.Sprintf("%6.2f%% done, %s/s, ETA %d:%02d:%02d",
-			100*float32(curr)/float32(s.bytesTotal),
-			humanSpeed,
+		progressMessage = fmt.Sprintf("%s/s, ETA %d:%02d:%02d",
+			humanReadableSize(float32(curr-s.bytesPrev)),
 			seconds/3600, seconds/60%60, seconds%60)
 	}
+	status = fmt.Sprintf("%6.2f%% done, %s",
+		100*float32(curr)/float32(s.bytesTotal), progressMessage)
 
 	s.bytesPrev = curr
 	return
@@ -377,7 +376,7 @@ func (s *State) Fetch(src string) int {
 		fmt.Fprintf(errorWriter, "ERROR: \"%s\" already exists. Skipping.\n", s.output)
 		return 1
 	}
-	fmt.Fprintln(messageWriter, "Output file:", s.output)
+	fmt.Fprintf(messageWriter, "Output file:\t\t%s\n", s.output)
 
 	// Get the target length
 	client := httpClient("tordl")
@@ -391,7 +390,7 @@ func (s *State) Fetch(src string) int {
 		return 1
 	}
 	s.bytesTotal = resp.ContentLength
-	fmt.Fprintln(messageWriter, "Download length:", humanReadableSize(float32(s.bytesTotal)))
+	fmt.Fprintf(messageWriter, "Download filesize:\t%s\n", humanReadableSize(float32(s.bytesTotal)))
 
 	// Create the output file. This will overwrite an existing file
 	file, err := os.Create(s.output)
@@ -462,9 +461,17 @@ func (s *State) Fetch(src string) int {
 
 				if s.chunks[longest].length == 0 {
 					// All done
-					s.printPermanent(fmt.Sprintf("Download completed in %s", time.Since(startTime).Round(time.Second)))
-					stop_status <- true
+					howLong := time.Since(startTime)
+					averageSpeed := humanReadableSize(float32(s.bytesTotal) / float32(howLong.Seconds()))
 
+					// Clear progress, otherwise some text artifacts remain
+					s.printTemporary(strings.Repeat(" ", 42))
+
+					s.printPermanent(fmt.Sprintf("Download completed in:\t%s (%s/s)",
+						howLong.Round(time.Second),
+						averageSpeed))
+
+					stop_status <- true
 					return 0
 				}
 				if s.chunks[longest].length <= 5*torBlock {
@@ -576,13 +583,15 @@ func main() {
 	// If the -quiet or -silent argument was used, don't print non-error text
 	if quiet || silent {
 		messageWriter = io.Discard
+
+		// if -silent argument was used, also don't print errors
+		if silent {
+			errorWriter = io.Discard
+		} else {
+			errorWriter = os.Stderr
+		}
 	} else {
 		messageWriter = os.Stdout
-	}
-	// if -silent argument was used, also don't print errors
-	if silent {
-		errorWriter = io.Discard
-	} else {
 		errorWriter = os.Stderr
 	}
 

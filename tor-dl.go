@@ -51,6 +51,8 @@ type State struct {
 	src         string
 	output      string
 	bytesTotal  int64
+	min         int64
+	max         int64
 	bytesPrev   int64
 	circuits    int
 	minLifetime time.Duration
@@ -385,10 +387,10 @@ func (s *State) Fetch(src string) int {
 		fmt.Fprintf(errorWriter, "ERROR - Unable to connect to Tor proxy. Is it running?: %v\n", err)
 		return 1
 	}
-	if resp.ContentLength <= 0 {
-		fmt.Fprintln(errorWriter, "ERROR - Failed to retrieve download length")
-		return 1
-	}
+	//if resp.ContentLength <= 0 {
+	//	fmt.Fprintln(errorWriter, "ERROR - Failed to retrieve download length")
+	//	return 1
+	//}
 	s.bytesTotal = resp.ContentLength
 	fmt.Fprintf(messageWriter, "Download filesize:\t%s\n", humanReadableSize(float32(s.bytesTotal)))
 
@@ -402,16 +404,31 @@ func (s *State) Fetch(src string) int {
 		return 1
 	}
 
-	// Initialize chunks
-	chunkLen := s.bytesTotal / int64(s.circuits)
+	// Жёсткий диапазон для скачивания
+	s.min = 2000000
+	s.max = 9000000
+
+	// Вычисляем длину всего диапазона (включительно)
+	rangeLen := s.max - s.min + 1
+	// Длина одного чанка
+	chunkLen := rangeLen / int64(s.circuits)
+
+	// Инициализируем чанки
 	seq := 0
-	for id := range s.circuits {
-		s.chunks[id].start = int64(id) * chunkLen
-		s.chunks[id].length = chunkLen
+	for id := range s.chunks {
+		// с какого байта стартует этот чанк
+		s.chunks[id].start = s.min + int64(id)*chunkLen
+
+		// длина: у последнего чанка добавляем остаток
+		if id == s.circuits-1 {
+			s.chunks[id].length = rangeLen - int64(id)*chunkLen
+		} else {
+			s.chunks[id].length = chunkLen
+		}
+
 		s.chunks[id].circuit = seq
 		seq++
 	}
-	s.chunks[s.circuits-1].length += s.bytesTotal % int64(s.circuits)
 
 	// If not -quiet or -silent, update status message every 1 second
 	if !quiet && !silent {
@@ -575,10 +592,10 @@ Usage: tor-dl [FLAGS] {file.txt | URL [URL2...]}
 
 func main() {
 	flag.Parse()
-	if flag.NArg() < 1 {
-		flag.Usage()
-		os.Exit(0)
-	}
+	//if flag.NArg() < 1 {
+	//	flag.Usage()
+	//	os.Exit(0)
+	//}
 
 	// If the -quiet or -silent argument was used, don't print non-error text
 	if quiet || silent {
@@ -596,6 +613,7 @@ func main() {
 	}
 
 	var uris []string
+	uris = append(uris, "https://rr2---sn-cxxapox31-5a56.googlevideo.com/videoplayback?expire=1751319489&ei=Ya9iaK-IHtWSv_IP0OmTcQ&ip=37.99.97.248&id=o-AIMVnYkV_TsRU6JNcArr0Pijti79VdbyDyUr2B1iKYLY&itag=398&aitags=133%2C134%2C135%2C136%2C160%2C242%2C243%2C244%2C247%2C278%2C298%2C299%2C302%2C303%2C308%2C394%2C395%2C396%2C397%2C398%2C399%2C400&source=youtube&requiressl=yes&xpc=EgVo2aDSNQ%3D%3D&met=1751297889%2C&mh=iA&mm=31%2C29&mn=sn-cxxapox31-5a56%2Csn-5go7yner&ms=au%2Crdu&mv=m&mvi=2&pl=24&rms=au%2Cau&initcwndbps=2747500&bui=AY1jyLNEB_4Bnb317QlHBAQk2DqvQvPXQcELfpEWhoGK98Ijg7NMNH_mwkmLbvU6d10odyjT-UEX5jjw&vprv=1&svpuc=1&mime=video%2Fmp4&ns=P9MndopmL-5_RGG763h2ukcQ&rqh=1&gir=yes&clen=858643172&dur=3868.633&lmt=1682264004898307&mt=1751297611&fvip=2&keepalive=yes&lmw=1&c=TVHTML5&sefc=1&txp=5537434&n=Yca7krpMfmR6Cw&sparams=expire%2Cei%2Cip%2Cid%2Caitags%2Csource%2Crequiressl%2Cxpc%2Cbui%2Cvprv%2Csvpuc%2Cmime%2Cns%2Crqh%2Cgir%2Cclen%2Cdur%2Clmt&sig=AJfQdSswRQIhAMyir30p_KxGYLENyjXTyymPFXS6fc2G989UrY7mf6lOAiBm2GJqdsMOcrb6shDq4ih8bMU8j7Kkun1U08B7L2jF4g%3D%3D&lsparams=met%2Cmh%2Cmm%2Cmn%2Cms%2Cmv%2Cmvi%2Cpl%2Crms%2Cinitcwndbps&lsig=APaTxxMwRAIgUba2e9GGk1sd0xILiGETUmrd8PtGQZqnYO0-NCeKNAgCIDK3ANiI2VP3YcCfwoKKhZY-70XxXhRTJ0X70SysNWIl")
 
 	if flag.NArg() == 1 {
 		// Only one non-flag argument. Check if it's a URL or a text file
@@ -622,7 +640,7 @@ func main() {
 		}
 	} else {
 		// Multiple URLs passed as non-flag arguments
-		uris = flag.Args()
+		//uris = flag.Args()
 	}
 
 	if len(uris) > 1 {

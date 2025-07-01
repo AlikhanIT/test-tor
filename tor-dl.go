@@ -106,6 +106,8 @@ func NewState(ctx context.Context) *State {
 	s.done = make(chan int)
 	s.log = make(chan string, 10)
 	st, _ := os.Stdout.Stat()
+	s.min = minByte
+	s.max = maxByte
 	s.terminal = st.Mode()&os.ModeCharDevice == os.ModeCharDevice
 
 	return &s
@@ -392,7 +394,7 @@ func (s *State) Fetch(src string) int {
 	//	return 1
 	//}
 	s.bytesTotal = resp.ContentLength
-	fmt.Fprintf(messageWriter, "Download filesize:\t%s\n", humanReadableSize(float32(s.bytesTotal)))
+	fmt.Fprintf(messageWriter, "Download filesize:\t%s\n", humanReadableSize(float32(s.max)-float32(s.min)))
 
 	// Create the output file. This will overwrite an existing file
 	file, err := os.Create(s.output)
@@ -405,8 +407,17 @@ func (s *State) Fetch(src string) int {
 	}
 
 	// Жёсткий диапазон для скачивания
-	s.min = 2000000
-	s.max = 9000000
+	if s.min == 0 && s.max == 0 {
+		// если пользователь ничего не задал — использовать весь файл
+		s.min = 0
+		s.max = s.bytesTotal - 1
+	} else {
+		// проверка на валидность диапазона
+		if s.min < 0 || s.max >= s.bytesTotal || s.min > s.max {
+			fmt.Fprintf(errorWriter, "ERROR: Invalid range: min=%d, max=%d, file size=%d\n", s.min, s.max, s.bytesTotal)
+			return 1
+		}
+	}
 
 	// Вычисляем длину всего диапазона (включительно)
 	rangeLen := s.max - s.min + 1
@@ -522,11 +533,16 @@ var quiet bool
 var silent bool
 var torPort int
 var verbose bool
+var minByte int64
+var maxByte int64
 
 var errorWriter io.Writer
 var messageWriter io.Writer
 
 func init() {
+	flag.Int64Var(&minByte, "min", 0, "Start byte offset for partial download (inclusive)")
+	flag.Int64Var(&maxByte, "max", 0, "End byte offset for partial download (inclusive)")
+
 	// Set up CLI arguments
 	flag.BoolVar(&allowHttp, "allow-http", false, "Allow tor-dl to download files over HTTP instead of HTTPS. Not recommended!")
 
@@ -613,7 +629,6 @@ func main() {
 	}
 
 	var uris []string
-	uris = append(uris, "https://rr2---sn-cxxapox31-5a56.googlevideo.com/videoplayback?expire=1751319489&ei=Ya9iaK-IHtWSv_IP0OmTcQ&ip=37.99.97.248&id=o-AIMVnYkV_TsRU6JNcArr0Pijti79VdbyDyUr2B1iKYLY&itag=398&aitags=133%2C134%2C135%2C136%2C160%2C242%2C243%2C244%2C247%2C278%2C298%2C299%2C302%2C303%2C308%2C394%2C395%2C396%2C397%2C398%2C399%2C400&source=youtube&requiressl=yes&xpc=EgVo2aDSNQ%3D%3D&met=1751297889%2C&mh=iA&mm=31%2C29&mn=sn-cxxapox31-5a56%2Csn-5go7yner&ms=au%2Crdu&mv=m&mvi=2&pl=24&rms=au%2Cau&initcwndbps=2747500&bui=AY1jyLNEB_4Bnb317QlHBAQk2DqvQvPXQcELfpEWhoGK98Ijg7NMNH_mwkmLbvU6d10odyjT-UEX5jjw&vprv=1&svpuc=1&mime=video%2Fmp4&ns=P9MndopmL-5_RGG763h2ukcQ&rqh=1&gir=yes&clen=858643172&dur=3868.633&lmt=1682264004898307&mt=1751297611&fvip=2&keepalive=yes&lmw=1&c=TVHTML5&sefc=1&txp=5537434&n=Yca7krpMfmR6Cw&sparams=expire%2Cei%2Cip%2Cid%2Caitags%2Csource%2Crequiressl%2Cxpc%2Cbui%2Cvprv%2Csvpuc%2Cmime%2Cns%2Crqh%2Cgir%2Cclen%2Cdur%2Clmt&sig=AJfQdSswRQIhAMyir30p_KxGYLENyjXTyymPFXS6fc2G989UrY7mf6lOAiBm2GJqdsMOcrb6shDq4ih8bMU8j7Kkun1U08B7L2jF4g%3D%3D&lsparams=met%2Cmh%2Cmm%2Cmn%2Cms%2Cmv%2Cmvi%2Cpl%2Crms%2Cinitcwndbps&lsig=APaTxxMwRAIgUba2e9GGk1sd0xILiGETUmrd8PtGQZqnYO0-NCeKNAgCIDK3ANiI2VP3YcCfwoKKhZY-70XxXhRTJ0X70SysNWIl")
 
 	if flag.NArg() == 1 {
 		// Only one non-flag argument. Check if it's a URL or a text file
@@ -640,7 +655,7 @@ func main() {
 		}
 	} else {
 		// Multiple URLs passed as non-flag arguments
-		//uris = flag.Args()
+		uris = flag.Args()
 	}
 
 	if len(uris) > 1 {
@@ -649,7 +664,6 @@ func main() {
 		// Ignore the -name argument when multiple files are provided, just use the URL's filename
 		if name != "" {
 			fmt.Fprintln(messageWriter, "WARNING: The -name argument is not usable when multiple URLs are provided. Ignoring.")
-			name = ""
 		}
 	} else if len(uris) < 1 {
 		fmt.Fprintln(errorWriter, "ERROR: No URLs found.")

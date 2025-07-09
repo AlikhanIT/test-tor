@@ -34,34 +34,42 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type chunk struct {
-	start   int64
-	length  int64
-	circuit int
-	bytes   int64
-	since   time.Time
-	cancel  context.CancelFunc
+	start      int64
+	length     int64
+	circuit    int
+	bytes      int64
+	since      time.Time
+	cancel     context.CancelFunc
+	throughput float64
+	lastUpdate time.Time
+	active     bool
+	retries    int
 }
 
 type State struct {
-	ctx         context.Context
-	src         string
-	output      string
-	bytesTotal  int64
-	min         int64
-	max         int64
-	bytesPrev   int64
-	circuits    int
-	minLifetime time.Duration
-	verbose     bool
-	chunks      []chunk
-	done        chan int
-	log         chan string
-	terminal    bool
-	rwmutex     sync.RWMutex
+	ctx               context.Context
+	src               string
+	output            string
+	bytesTotal        int64
+	bytesPrev         int64
+	circuits          int
+	minLifetime       time.Duration
+	verbose           bool
+	chunks            []chunk
+	done              chan int
+	log               chan string
+	terminal          bool
+	rwmutex           sync.RWMutex
+	completedChunks   int64
+	minChunkSize      int64
+	maxRetries        int
+	rebalanceInterval time.Duration
+	darwinInterval    time.Duration
 }
 
 const torBlock = 8000 // The longest plain text block in Tor
@@ -91,7 +99,13 @@ func httpClient(user string) *http.Client {
 	}
 
 	return &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)},
+		Transport: &http.Transport{
+			Proxy:               http.ProxyURL(proxyUrl),
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     30 * time.Second,
+		},
+		Timeout: 60 * time.Second,
 	}
 }
 
@@ -103,11 +117,13 @@ func NewState(ctx context.Context) *State {
 	s.verbose = verbose
 	s.chunks = make([]chunk, s.circuits)
 	s.ctx = ctx
-	s.done = make(chan int)
-	s.log = make(chan string, 10)
+	s.done = make(chan int, s.circuits)   // Buffered channel to prevent blocking
+	s.log = make(chan string, 50)         // Increased buffer size
+	s.minChunkSize = int64(torBlock * 10) // Minimum chunk size to avoid too many small chunks
+	s.maxRetries = 3
+	s.rebalanceInterval = 5 * time.Second
+	s.darwinInterval = 15 * time.Second
 	st, _ := os.Stdout.Stat()
-	s.min = minByte
-	s.max = maxByte
 	s.terminal = st.Mode()&os.ModeCharDevice == os.ModeCharDevice
 
 	return &s
@@ -128,10 +144,16 @@ func (s *State) printTemporary(txt string) {
 }
 
 func (s *State) chunkInit(id int) (client *http.Client, req *http.Request) {
+	s.rwmutex.Lock()
 	s.chunks[id].bytes = 0
 	s.chunks[id].since = time.Now()
+	s.chunks[id].lastUpdate = time.Now()
+	s.chunks[id].active = true
+	s.chunks[id].throughput = 0
 	ctx, cancel := context.WithCancel(s.ctx)
 	s.chunks[id].cancel = cancel
+	s.rwmutex.Unlock()
+
 	client = httpClient(fmt.Sprintf("tg%d", s.chunks[id].circuit))
 	req, _ = http.NewRequestWithContext(ctx, "GET", s.src, nil)
 	req.Header.Add("Range", fmt.Sprintf("bytes=%d-%d",
@@ -141,6 +163,9 @@ func (s *State) chunkInit(id int) (client *http.Client, req *http.Request) {
 
 func (s *State) chunkFetch(id int, client *http.Client, req *http.Request) {
 	defer func() {
+		s.rwmutex.Lock()
+		s.chunks[id].active = false
+		s.rwmutex.Unlock()
 		s.done <- id
 	}()
 
@@ -153,55 +178,75 @@ func (s *State) chunkFetch(id int, client *http.Client, req *http.Request) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		s.log <- fmt.Sprintf("Client Do: %s", err.Error())
+		s.rwmutex.Lock()
+		s.chunks[id].retries++
+		s.rwmutex.Unlock()
+		s.log <- fmt.Sprintf("Client Do (chunk %d): %s", id, err.Error())
 		return
 	}
 	if resp.Body == nil {
-		s.log <- "Client Do: No response body"
+		s.log <- fmt.Sprintf("Client Do (chunk %d): No response body", id)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusPartialContent {
-		s.log <- fmt.Sprintf("Client Do: Unexpected HTTP status: %d", resp.StatusCode)
+		s.log <- fmt.Sprintf("Client Do (chunk %d): Unexpected HTTP status: %d", id, resp.StatusCode)
 		return
 	}
 
 	// Open the output file
 	file, err := os.OpenFile(s.output, os.O_WRONLY, 0)
 	if err != nil {
-		s.log <- fmt.Sprintf("os OpenFile: %s", err.Error())
+		s.log <- fmt.Sprintf("os OpenFile (chunk %d): %s", id, err.Error())
 		return
 	}
 	defer file.Close()
 
 	_, err = file.Seek(s.chunks[id].start, io.SeekStart)
 	if err != nil {
-		s.log <- fmt.Sprintf("File Seek: %s", err.Error())
+		s.log <- fmt.Sprintf("File Seek (chunk %d): %s", id, err.Error())
 		return
 	}
 
 	// Copy network data to the output file
-	buffer := make([]byte, torBlock)
+	buffer := make([]byte, torBlock*2) // Increased buffer size
+	lastProgressUpdate := time.Now()
+
 	for {
 		n, err := resp.Body.Read(buffer)
 		if n > 0 {
 			file.Write(buffer[:n])
-			// Enough to RLock(), as we only modify our own chunk
-			s.rwmutex.RLock()
+			now := time.Now()
+
+			s.rwmutex.Lock()
 			if int64(n) < s.chunks[id].length {
 				s.chunks[id].start += int64(n)
 				s.chunks[id].length -= int64(n)
 				s.chunks[id].bytes += int64(n)
+
+				// Update throughput calculation more frequently
+				if now.Sub(lastProgressUpdate) > time.Second {
+					elapsed := now.Sub(s.chunks[id].since)
+					if elapsed > 0 {
+						s.chunks[id].throughput = float64(s.chunks[id].bytes) / elapsed.Seconds()
+					}
+					s.chunks[id].lastUpdate = now
+					lastProgressUpdate = now
+				}
 			} else {
+				s.chunks[id].bytes += s.chunks[id].length
 				s.chunks[id].length = 0
 			}
-			s.rwmutex.RUnlock()
+			s.rwmutex.Unlock()
+
 			if s.chunks[id].length == 0 {
 				break
 			}
 		}
 		if err != nil {
-			s.log <- fmt.Sprintf("ReadCloser Read: %s", err.Error())
+			if err != io.EOF {
+				s.log <- fmt.Sprintf("ReadCloser Read (chunk %d): %s", id, err.Error())
+			}
 			break
 		}
 	}
@@ -233,6 +278,10 @@ func (s *State) getExitNode(id int, client *http.Client) error {
 
 func (s *State) printLogs() {
 	n := len(s.log)
+	if n == 0 {
+		return
+	}
+
 	logs := make([]string, n+1)
 	for i := 0; i < n; i++ {
 		logs[i] = <-s.log
@@ -269,18 +318,27 @@ func (s *State) statusLine() (status string) {
 	curr := s.bytesTotal
 
 	s.rwmutex.RLock()
+	activeChunks := 0
 	for id := range s.circuits {
 		curr -= s.chunks[id].length
+		if s.chunks[id].active {
+			activeChunks++
+		}
 	}
 	s.rwmutex.RUnlock()
 
 	if curr == s.bytesPrev {
 		progressMessage = "stalled"
 	} else {
-		seconds := (s.bytesTotal - curr) / (curr - s.bytesPrev)
-		progressMessage = fmt.Sprintf("%s/s, ETA %d:%02d:%02d",
-			humanReadableSize(float32(curr-s.bytesPrev)),
-			seconds/3600, seconds/60%60, seconds%60)
+		bytesPerSecond := curr - s.bytesPrev
+		if bytesPerSecond > 0 {
+			seconds := (s.bytesTotal - curr) / bytesPerSecond
+			progressMessage = fmt.Sprintf("%s/s, ETA %d:%02d:%02d (%d active)",
+				humanReadableSize(float32(bytesPerSecond)),
+				seconds/3600, seconds/60%60, seconds%60, activeChunks)
+		} else {
+			progressMessage = "calculating..."
+		}
 	}
 	status = fmt.Sprintf("%6.2f%% done, %s",
 		100*float32(curr)/float32(s.bytesTotal), progressMessage)
@@ -298,33 +356,102 @@ func (s *State) progress() {
 	s.printTemporary(s.statusLine())
 }
 
+// Improved chunk rebalancing algorithm
+func (s *State) rebalanceChunks() {
+	s.rwmutex.Lock()
+	defer s.rwmutex.Unlock()
+
+	// Find the chunk with the most remaining data
+	var longestLength int64 = 0
+
+	// Also track fast and slow performers
+	var fastChunks []int
+	var slowChunks []int
+	now := time.Now()
+
+	for i := 0; i < s.circuits; i++ {
+		if s.chunks[i].length > longestLength {
+			longestLength = s.chunks[i].length
+
+		}
+
+		// Classify chunks by performance
+		if s.chunks[i].active && s.chunks[i].length > 0 {
+			elapsed := now.Sub(s.chunks[i].since)
+			if elapsed > 5*time.Second { // Only consider chunks that have been running for a while
+				if s.chunks[i].throughput > 50000 { // Fast: > 50KB/s
+					fastChunks = append(fastChunks, i)
+				} else if s.chunks[i].throughput < 10000 { // Slow: < 10KB/s
+					slowChunks = append(slowChunks, i)
+				}
+			}
+		}
+	}
+
+	// Cancel slow chunks and redistribute their work to fast chunks
+	for _, slowIdx := range slowChunks {
+		if s.chunks[slowIdx].length > s.minChunkSize && len(fastChunks) > 0 {
+			// Cancel the slow chunk
+			if s.chunks[slowIdx].cancel != nil {
+				s.chunks[slowIdx].cancel()
+				s.chunks[slowIdx].cancel = nil
+			}
+
+			// Redistribute its work to the fastest chunk
+			if len(fastChunks) > 0 {
+				fastestIdx := fastChunks[0]
+				maxThroughput := s.chunks[fastestIdx].throughput
+				for _, idx := range fastChunks {
+					if s.chunks[idx].throughput > maxThroughput {
+						maxThroughput = s.chunks[idx].throughput
+						fastestIdx = idx
+					}
+				}
+
+				// Transfer work from slow to fast chunk
+				s.chunks[fastestIdx].length += s.chunks[slowIdx].length
+				s.chunks[slowIdx].length = 0
+			}
+		}
+	}
+}
+
 // Kill the worst performing circuit
 func (s *State) darwin() {
 	victim := -1
-	var slowest float64
+	var slowest float64 = 1e9 // Start with a very high value
 	now := time.Now()
 
 	s.rwmutex.RLock()
 	for id := range s.circuits {
-		if s.chunks[id].cancel == nil {
+		if s.chunks[id].cancel == nil || !s.chunks[id].active {
 			continue
 		}
-		eplased := now.Sub(s.chunks[id].since)
-		if eplased < s.minLifetime {
+		elapsed := now.Sub(s.chunks[id].since)
+		if elapsed < s.minLifetime {
 			continue
 		}
-		throughput := float64(s.chunks[id].bytes) / eplased.Seconds()
-		if victim >= 0 && throughput >= slowest {
-			continue
+
+		// Consider both throughput and retry count
+		throughput := s.chunks[id].throughput
+		retryPenalty := float64(s.chunks[id].retries) * 1000 // Penalize retries
+		adjustedThroughput := throughput - retryPenalty
+
+		if adjustedThroughput < slowest && s.chunks[id].length > s.minChunkSize {
+			victim = id
+			slowest = adjustedThroughput
 		}
-		victim = id
-		slowest = throughput
-	}
-	if victim >= 0 {
-		s.chunks[victim].cancel()
-		s.chunks[victim].cancel = nil
 	}
 	s.rwmutex.RUnlock()
+
+	if victim >= 0 {
+		s.rwmutex.Lock()
+		if s.chunks[victim].cancel != nil {
+			s.chunks[victim].cancel()
+			s.chunks[victim].cancel = nil
+		}
+		s.rwmutex.Unlock()
+	}
 }
 
 func (s *State) getOutputFilepath() {
@@ -389,12 +516,12 @@ func (s *State) Fetch(src string) int {
 		fmt.Fprintf(errorWriter, "ERROR - Unable to connect to Tor proxy. Is it running?: %v\n", err)
 		return 1
 	}
-	//if resp.ContentLength <= 0 {
-	//	fmt.Fprintln(errorWriter, "ERROR - Failed to retrieve download length")
-	//	return 1
-	//}
+	if resp.ContentLength <= 0 {
+		fmt.Fprintln(errorWriter, "ERROR - Failed to retrieve download length")
+		return 1
+	}
 	s.bytesTotal = resp.ContentLength
-	fmt.Fprintf(messageWriter, "Download filesize:\t%s\n", humanReadableSize(float32(s.max)-float32(s.min)))
+	fmt.Fprintf(messageWriter, "Download filesize:\t%s\n", humanReadableSize(float32(s.bytesTotal)))
 
 	// Create the output file. This will overwrite an existing file
 	file, err := os.Create(s.output)
@@ -406,119 +533,175 @@ func (s *State) Fetch(src string) int {
 		return 1
 	}
 
-	// Жёсткий диапазон для скачивания
-	if s.min == 0 && s.max == 0 {
-		// если пользователь ничего не задал — использовать весь файл
-		s.min = 0
-		s.max = s.bytesTotal - 1
-	} else {
-		// проверка на валидность диапазона
-		if s.min < 0 || s.max >= s.bytesTotal || s.min > s.max {
-			fmt.Fprintf(errorWriter, "ERROR: Invalid range: min=%d, max=%d, file size=%d\n", s.min, s.max, s.bytesTotal)
-			return 1
-		}
-	}
+	// Initialize chunks with better distribution
+	baseChunkLen := s.bytesTotal / int64(s.circuits)
+	remainder := s.bytesTotal % int64(s.circuits)
 
-	// Вычисляем длину всего диапазона (включительно)
-	rangeLen := s.max - s.min + 1
-	// Длина одного чанка
-	chunkLen := rangeLen / int64(s.circuits)
-
-	// Инициализируем чанки
 	seq := 0
-	for id := range s.chunks {
-		// с какого байта стартует этот чанк
-		s.chunks[id].start = s.min + int64(id)*chunkLen
-
-		// длина: у последнего чанка добавляем остаток
-		if id == s.circuits-1 {
-			s.chunks[id].length = rangeLen - int64(id)*chunkLen
-		} else {
-			s.chunks[id].length = chunkLen
-		}
-
+	for id := range s.circuits {
+		s.chunks[id].start = int64(id) * baseChunkLen
+		s.chunks[id].length = baseChunkLen
 		s.chunks[id].circuit = seq
+		s.chunks[id].retries = 0
+
+		// Distribute remainder among first few chunks
+		if int64(id) < remainder {
+			s.chunks[id].length++
+			// Adjust start positions for subsequent chunks
+			for j := id + 1; j < s.circuits; j++ {
+				s.chunks[j].start++
+			}
+		}
 		seq++
 	}
 
 	// If not -quiet or -silent, update status message every 1 second
 	if !quiet && !silent {
-		stop_status = make(chan bool)
+		stop_status = make(chan bool, 1)
 		go func() {
-			for {
-				time.Sleep(time.Second)
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
 
+			for {
 				select {
 				case <-stop_status:
-					close(stop_status)
 					return
-				default:
+				case <-ticker.C:
 					s.progress()
 				}
 			}
 		}()
 	}
 
+	// Start rebalancing goroutine
+	rebalanceTicker := time.NewTicker(s.rebalanceInterval)
+	defer rebalanceTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-rebalanceTicker.C:
+				s.rebalanceChunks()
+			}
+		}
+	}()
+
+	// Start darwin goroutine
+	darwinTicker := time.NewTicker(s.darwinInterval)
+	defer darwinTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-darwinTicker.C:
+				s.darwin()
+			}
+		}
+	}()
+
 	// Spawn initial fetchers
 	go func() {
 		for id := range s.circuits {
 			client, req := s.chunkInit(id)
 			go s.chunkFetch(id, client, req)
-			time.Sleep(499 * time.Millisecond) // Be gentle to the local tor daemon
+			time.Sleep(200 * time.Millisecond) // Reduced delay
 		}
 	}()
 
-	// Spawn additional fetchers as needed
+	// Main download loop
 	for {
 		select {
 		case id := <-s.done:
-			if s.chunks[id].length > 0 {
-				// Error. Resume in a new and hopefully faster circuit
-				s.chunks[id].circuit = seq
-				seq++
+			s.rwmutex.RLock()
+			chunkLength := s.chunks[id].length
+			retries := s.chunks[id].retries
+			s.rwmutex.RUnlock()
+
+			if chunkLength > 0 {
+				// Error occurred or chunk was cancelled
+				if retries < s.maxRetries {
+					// Retry with new circuit
+					s.rwmutex.Lock()
+					s.chunks[id].circuit = seq
+					seq++
+					s.rwmutex.Unlock()
+
+					client, req := s.chunkInit(id)
+					go s.chunkFetch(id, client, req)
+				} else {
+					// Too many retries, redistribute work to the chunk with most remaining data
+					s.rwmutex.Lock()
+					bestIdx := -1
+					maxLength := int64(0)
+
+					for i := 0; i < s.circuits; i++ {
+						if i != id && s.chunks[i].length > maxLength {
+							maxLength = s.chunks[i].length
+							bestIdx = i
+						}
+					}
+
+					if bestIdx >= 0 {
+						s.chunks[bestIdx].length += s.chunks[id].length
+						s.chunks[id].length = 0
+					}
+					s.rwmutex.Unlock()
+				}
 			} else {
-				// Completed
-				longest := 0
+				// Chunk completed successfully
+				atomic.AddInt64(&s.completedChunks, 1)
+
+				// Check if all chunks are completed and find longest remaining chunk
 				s.rwmutex.RLock()
-				for i := 1; i < s.circuits; i++ {
-					if s.chunks[i].length > s.chunks[longest].length {
-						longest = i
+				allDone := true
+				targetIdx := -1
+				maxLength := int64(0)
+
+				for i := 0; i < s.circuits; i++ {
+					if s.chunks[i].length > 0 {
+						allDone = false
+						if s.chunks[i].length > maxLength {
+							maxLength = s.chunks[i].length
+							targetIdx = i
+						}
 					}
 				}
 				s.rwmutex.RUnlock()
 
-				if s.chunks[longest].length == 0 {
-					// All done
+				if allDone {
+					// All done!
 					howLong := time.Since(startTime)
 					averageSpeed := humanReadableSize(float32(s.bytesTotal) / float32(howLong.Seconds()))
 
-					// Clear progress, otherwise some text artifacts remain
-					s.printTemporary(strings.Repeat(" ", 42))
-
+					// Clear progress
+					s.printTemporary(strings.Repeat(" ", 50))
 					s.printPermanent(fmt.Sprintf("Download completed in:\t%s (%s/s)",
-						howLong.Round(time.Second),
-						averageSpeed))
+						howLong.Round(time.Second), averageSpeed))
 
-					stop_status <- true
+					if !quiet && !silent {
+						stop_status <- true
+					}
 					return 0
 				}
-				if s.chunks[longest].length <= 5*torBlock {
-					// Too short to split
-					continue
+
+				// Split work with the longest remaining chunk
+				if targetIdx >= 0 && maxLength > s.minChunkSize*2 {
+					s.rwmutex.Lock()
+					splitSize := maxLength / 2
+					s.chunks[id].length = splitSize
+					s.chunks[targetIdx].length = maxLength - splitSize
+					s.chunks[id].start = s.chunks[targetIdx].start + s.chunks[targetIdx].length
+					s.chunks[id].circuit = seq
+					s.chunks[id].retries = 0
+					seq++
+					s.rwmutex.Unlock()
+
+					client, req := s.chunkInit(id)
+					go s.chunkFetch(id, client, req)
 				}
-
-				// This circuit is faster, so we split 80%/20%
-				s.rwmutex.Lock()
-				s.chunks[id].length = s.chunks[longest].length * 4 / 5
-				s.chunks[longest].length -= s.chunks[id].length
-				s.chunks[id].start = s.chunks[longest].start + s.chunks[longest].length
-				s.rwmutex.Unlock()
 			}
-
-			client, req := s.chunkInit(id)
-			go s.chunkFetch(id, client, req)
-		case <-time.After(time.Second * 30):
-			s.darwin()
 		}
 	}
 }
@@ -533,16 +716,11 @@ var quiet bool
 var silent bool
 var torPort int
 var verbose bool
-var minByte int64
-var maxByte int64
 
 var errorWriter io.Writer
 var messageWriter io.Writer
 
 func init() {
-	flag.Int64Var(&minByte, "min", 0, "Start byte offset for partial download (inclusive)")
-	flag.Int64Var(&maxByte, "max", 0, "End byte offset for partial download (inclusive)")
-
 	// Set up CLI arguments
 	flag.BoolVar(&allowHttp, "allow-http", false, "Allow tor-dl to download files over HTTP instead of HTTPS. Not recommended!")
 
@@ -569,8 +747,8 @@ func init() {
 	flag.IntVar(&torPort, "tor-port", 9050, "Port your Tor service is listening on.")
 	flag.IntVar(&torPort, "p", 9050, "Port your Tor service is listening on.")
 
-	flag.BoolVar(&verbose, "verbose", false, "Show iagnostic details.")
-	flag.BoolVar(&verbose, "v", false, "Show iagnostic details.")
+	flag.BoolVar(&verbose, "verbose", false, "Show diagnostic details.")
+	flag.BoolVar(&verbose, "v", false, "Show diagnostic details.")
 
 	// Custom usage message to avoid duplicate entries for long & short flags
 	flag.Usage = func() {
@@ -608,10 +786,10 @@ Usage: tor-dl [FLAGS] {file.txt | URL [URL2...]}
 
 func main() {
 	flag.Parse()
-	//if flag.NArg() < 1 {
-	//	flag.Usage()
-	//	os.Exit(0)
-	//}
+	if flag.NArg() < 1 {
+		flag.Usage()
+		os.Exit(0)
+	}
 
 	// If the -quiet or -silent argument was used, don't print non-error text
 	if quiet || silent {
@@ -664,6 +842,7 @@ func main() {
 		// Ignore the -name argument when multiple files are provided, just use the URL's filename
 		if name != "" {
 			fmt.Fprintln(messageWriter, "WARNING: The -name argument is not usable when multiple URLs are provided. Ignoring.")
+			name = ""
 		}
 	} else if len(uris) < 1 {
 		fmt.Fprintln(errorWriter, "ERROR: No URLs found.")

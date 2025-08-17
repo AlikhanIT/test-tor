@@ -2,30 +2,17 @@ package main
 
 /*
    tor-dl - fast large file downloader over locally installed Tor
-   Optimized queue-based segmented downloader for uniform throughput.
-
-   Copyright © 2025 Bryan Cuneo <https://github.com/BryanCuneo/tor-dl/>
-   Based on torget by Michał Trojnara <https://github.com/mtrojnar/torget>
-
+   Segmented downloader with:
+     - Redirect-safe headers
+     - Exponential backoff + jitter
+     - Global RPS limiter
+     - Tail-mode with sharded tail (no open-ended stall)
+     - Immediate circuit rotate on 403/429
+     - Aggressive split on 403/timeout
+     - Multi-port Tor fanout
+     - Shuffled segments (better balance)
+     - Time/percent logger
    GPLv3
-
-   This file contains an improved version of the original tor-dl implementation.
-   The improvements are aimed at making the segmented download more
-   consistent and keeping all worker circuits busy for as long as possible.
-
-   The original implementation would sometimes generate only a small number
-   of relatively large segments. When the download neared completion, there
-   might only be a handful of segments left to process. Because each
-   segment is handled by exactly one worker, the remaining workers would
-   become idle, causing the overall download speed to drop sharply toward
-   the end of the transfer. The changes in this file address that issue by
-   generating more, smaller segments up front and by sizing the work queue
-   to accommodate all of them without blocking. This ensures that a
-   sufficient number of segments are available to keep every worker busy
-   until the very end of the download.
-
-   If you wish to keep using the original version, refer to the previous
-   tor-dl.go file; otherwise, build and run this version instead.
 */
 
 import (
@@ -37,44 +24,52 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"math/rand"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-const (
-	// torBlockDefault defines a base chunk size used when copying data
-	// from the HTTP response into the output file. It matches the
-	// 8 KiB network buffer size so that we operate on complete
-	// multiples where possible.
-	torBlockDefault = 8192
+const torBlockDefault = 8192
+
+// ===== CLI flags =====
+var (
+	allowHttp      bool
+	circuits       int
+	destination    string
+	force          bool
+	minLifetime    int
+	name           string
+	quiet          bool
+	silent         bool
+	verbose        bool
+	cliSegmentSize int64
+	cliMaxRetries  int
+
+	userAgent      string
+	referer        string
+	torPortsCSV    string // comma-separated list; if empty, use -p
+	torPortSingle  int    // -p / -tor-port (compat)
+	rps            int
+	tailThresholdB int64
+	tailMaxWorkers int
+	retryBaseMs    int
+
+	// tail sharding
+	tailShardMin int64 // минимальный размер шардов в хвосте
+	tailShardMax int64 // верхняя граница шардов
+
+	errorWriter   io.Writer
+	messageWriter io.Writer
 )
-
-// ===== CLI flags (compatible with the original version) =====
-var allowHttp bool
-var circuits int
-var destination string
-var force bool
-var minLifetime int
-var name string
-var quiet bool
-var silent bool
-var torPort int
-var verbose bool
-
-// New (optional) flags
-var cliSegmentSize int64
-var cliMaxRetries int
-
-// ===== global writers for output =====
-var errorWriter io.Writer
-var messageWriter io.Writer
 
 // ===== utilities =====
 func humanReadableSize(sizeInBytes float64) string {
@@ -87,60 +82,119 @@ func humanReadableSize(sizeInBytes float64) string {
 	return fmt.Sprintf("%.2f %s", sizeInBytes, units[i])
 }
 
-// httpClient constructs a client configured to proxy traffic over
-// the locally running Tor instance. Each worker gets its own user
-// name embedded in the SOCKS URI so that Tor assigns a distinct
-// circuit to that logical user. Connections are configured to
-// respect HTTP/1.1 semantics (Range requests over SOCKS proxies do
-// not play well with HTTP/2) and to allow for many idle connections.
-func httpClient(user string) *http.Client {
-	proxyUrl, err := url.Parse(fmt.Sprintf("socks5://%s:%s@127.0.0.1:%d/", user, user, torPort))
-	if err != nil {
-		fmt.Fprintf(errorWriter, "ERROR - Failed to parse SOCKS5 URL for user '%s' and port '%d': %v\n", user, torPort, err)
-		os.Exit(1)
-	}
-	tr := &http.Transport{
-		Proxy:               http.ProxyURL(proxyUrl),
-		MaxIdleConns:        128,
-		MaxIdleConnsPerHost: 64,
-		IdleConnTimeout:     30 * time.Second,
-		DisableKeepAlives:   false,
-		ForceAttemptHTTP2:   false,
-	}
-	return &http.Client{
-		Transport: tr,
-		Timeout:   60 * time.Second,
-	}
+// ===== rate limiter =====
+type rateLimiter struct {
+	tokens chan struct{}
+	stop   chan struct{}
 }
 
-// ===== segment and state types =====
+func newRateLimiter(rps int) *rateLimiter {
+	if rps < 1 {
+		rps = 1
+	}
+	rl := &rateLimiter{
+		tokens: make(chan struct{}, rps),
+		stop:   make(chan struct{}),
+	}
+	interval := time.Second / time.Duration(rps)
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-rl.stop:
+				return
+			case <-t.C:
+				select {
+				case rl.tokens <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
+	return rl
+}
+func (rl *rateLimiter) take(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-rl.tokens:
+		return true
+	}
+}
+func (rl *rateLimiter) close() { close(rl.stop) }
+
+// ===== HTTP client factory (SOCKS5 over Tor) =====
+func httpClient(user string, port int) *http.Client {
+	proxyUrl, err := url.Parse(fmt.Sprintf("socks5://%s:%s@127.0.0.1:%d/", user, user, port))
+	if err != nil {
+		fmt.Fprintf(errorWriter, "ERROR - parse SOCKS5 URL '%s' port '%d': %v\n", user, port, err)
+		os.Exit(1)
+	}
+	jar, _ := cookiejar.New(nil)
+	tr := &http.Transport{
+		Proxy:               http.ProxyURL(proxyUrl),
+		MaxIdleConns:        256,
+		MaxIdleConnsPerHost: 128,
+		IdleConnTimeout:     45 * time.Second,
+		DisableKeepAlives:   false,
+		ForceAttemptHTTP2:   false, // HTTP/1.1 для Range
+		DisableCompression:  true,
+	}
+	cli := &http.Client{
+		Transport: tr,
+		Jar:       jar,
+		Timeout:   120 * time.Second,
+	}
+	cli.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) == 0 {
+			return nil
+		}
+		last := via[len(via)-1]
+		for k, vv := range last.Header {
+			if _, ok := req.Header[k]; !ok {
+				for _, v := range vv {
+					req.Header.Add(k, v)
+				}
+			}
+		}
+		return nil
+	}
+	return cli
+}
+
+// ===== segments & queue =====
 type segment struct {
 	start   int64
-	length  int64
+	length  int64 // 0 не используем (open-ended убрали)
 	attempt int
 }
 
-// workQueue wraps a buffered channel. It exposes simple methods
-// for enqueueing and dequeueing segments. By sizing the channel
-// appropriately we avoid blocking when preloading the queue with
-// all segments.
 type workQueue struct {
 	ch chan *segment
 }
 
-func newQueue(capacity int) *workQueue {
-	return &workQueue{ch: make(chan *segment, capacity)}
-}
-func (q *workQueue) push(s *segment) { q.ch <- s }
+func newQueue(capacity int) *workQueue { return &workQueue{ch: make(chan *segment, capacity)} }
+func (q *workQueue) push(s *segment)   { q.ch <- s }
 func (q *workQueue) pop() (*segment, bool) {
 	s, ok := <-q.ch
 	return s, ok
 }
-func (q *workQueue) close() { close(q.ch) }
+func (q *workQueue) pushDelayed(s *segment, d time.Duration) {
+	go func() {
+		time.Sleep(d)
+		q.push(s)
+	}()
+}
+func (q *workQueue) len() int { return len(q.ch) }
+func (q *workQueue) close()   { close(q.ch) }
 
-// State holds all mutable state for a single download. It
-// encapsulates configuration, progress tracking and worker
-// coordination.
+// ===== errors =====
+type httpStatusError struct{ code int }
+
+func (e *httpStatusError) Error() string { return fmt.Sprintf("http %d", e.code) }
+
+// ===== State =====
 type State struct {
 	ctx        context.Context
 	src        string
@@ -150,85 +204,93 @@ type State struct {
 
 	acceptRanges bool
 
-	// configuration
 	circuits    int
 	minLifetime time.Duration
 	verbose     bool
 
-	// progress tracking
 	prevBytes int64
+	log       chan string
+	terminal  bool
 
-	// log channel used when verbose is enabled
-	log chan string
-
-	// terminal indicates whether stdout is an interactive terminal
-	terminal bool
-
-	// queues and segment sizes
 	queue      *workQueue
 	segSize    int64
 	minSegSize int64
 	maxRetries int
 
-	// periodic ticker for potential future rebalancing (currently unused)
-	rebalanceTicker *time.Ticker
+	ua  string
+	ref string
 
-	// synchronization primitive for progress updates
-	progressMu sync.Mutex
+	tailThreshold int64
+	tailWorkers   int
+	activeTail    int32
+
+	retryBase time.Duration
+
+	ports []int
+	rl    *rateLimiter
+
+	// прогресс/лог
+	startTime time.Time
 }
 
-// ===== CLI initialization =====
+// ===== CLI init =====
 func init() {
-	flag.BoolVar(&allowHttp, "allow-http", false, "Allow tor-dl to download files over HTTP instead of HTTPS. Not recommended!")
-
+	flag.BoolVar(&allowHttp, "allow-http", false, "Allow HTTP (insecure).")
 	flag.IntVar(&circuits, "circuits", 20, "Concurrent circuits.")
 	flag.IntVar(&circuits, "c", 20, "Concurrent circuits.")
-
 	flag.StringVar(&destination, "destination", ".", "Output directory.")
 	flag.StringVar(&destination, "d", ".", "Output directory.")
-
-	flag.BoolVar(&force, "force", false, "Will create parent folder(s) and/or overwrite existing files.")
-
-	flag.IntVar(&minLifetime, "min-lifetime", 10, "Minimum circuit lifetime. (seconds)")
-	flag.IntVar(&minLifetime, "l", 10, "Minimum circuit lifetime. (seconds)")
-
+	flag.BoolVar(&force, "force", false, "Create parent folders / overwrite output.")
+	flag.IntVar(&minLifetime, "min-lifetime", 10, "Minimum circuit lifetime, seconds.")
+	flag.IntVar(&minLifetime, "l", 10, "Minimum circuit lifetime, seconds.")
 	flag.StringVar(&name, "name", "", "Output filename.")
 	flag.StringVar(&name, "n", "", "Output filename.")
+	flag.BoolVar(&quiet, "quiet", false, "Mute most output.")
+	flag.BoolVar(&quiet, "q", false, "Mute most output.")
+	flag.BoolVar(&silent, "silent", false, "Mute all output (incl. errors).")
+	flag.BoolVar(&silent, "s", false, "Mute all output (incl. errors).")
+	flag.BoolVar(&verbose, "verbose", false, "Verbose logs.")
+	flag.BoolVar(&verbose, "v", false, "Verbose logs.")
 
-	flag.BoolVar(&quiet, "quiet", false, "Suppress most text output (still show errors).")
-	flag.BoolVar(&quiet, "q", false, "Suppress most text output (still show errors).")
+	flag.Int64Var(&cliSegmentSize, "segment-size", 2*1024*1024, "Initial segment size, bytes (default 2MiB).")
+	flag.IntVar(&cliMaxRetries, "max-retries", 5, "Max retries before split or requeue.")
 
-	flag.BoolVar(&silent, "silent", false, "Suppress all text output (including errors).")
-	flag.BoolVar(&silent, "s", false, "Suppress all text output (including errors).")
+	flag.StringVar(&userAgent, "user-agent",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+		"HTTP User-Agent header.")
+	flag.StringVar(&referer, "referer", "https://www.youtube.com/", "HTTP Referer header.")
 
-	flag.IntVar(&torPort, "tor-port", 9050, "Port your Tor service is listening on.")
-	flag.IntVar(&torPort, "p", 9050, "Port your Tor service is listening on.")
+	// ports: либо -ports "9050,9150", либо одиночный -p/-tor-port 9050
+	flag.StringVar(&torPortsCSV, "ports", "", "Comma-separated Tor SOCKS ports, e.g. \"9050,9150\".")
+	flag.IntVar(&torPortSingle, "tor-port", 9050, "Single Tor SOCKS port (compat).")
+	flag.IntVar(&torPortSingle, "p", 9050, "Single Tor SOCKS port (compat, short).")
 
-	flag.BoolVar(&verbose, "verbose", false, "Show diagnostic details.")
-	flag.BoolVar(&verbose, "v", false, "Show diagnostic details.")
+	flag.IntVar(&rps, "rps", 8, "Global requests-per-second limit.")
+	flag.Int64Var(&tailThresholdB, "tail-threshold", 32*1024*1024, "Tail-mode threshold, bytes.")
+	flag.IntVar(&tailMaxWorkers, "tail-workers", 4, "Active workers allowed in tail-mode (use >1 to speed tail).")
+	flag.IntVar(&retryBaseMs, "retry-base-ms", 250, "Base backoff (ms).")
 
-	// new flags — by default we start with moderately small segments
-	flag.Int64Var(&cliSegmentSize, "segment-size", 2*1024*1024, "Initial segment size in bytes (default 2MiB). Use smaller values to increase concurrency.")
-	flag.IntVar(&cliMaxRetries, "max-retries", 5, "Max retries per segment before splitting or giving up.")
+	flag.Int64Var(&tailShardMin, "tail-shard-min", 256*1024, "Minimal shard size in tail-mode.")
+	flag.Int64Var(&tailShardMax, "tail-shard-max", 2*1024*1024, "Max shard size in tail-mode.")
 
 	flag.Usage = func() {
 		w := flag.CommandLine.Output()
-		msg := `tor-dl - fast large file downloader over locally installed Tor
-Licensed under GNU GPLv3
+		fmt.Fprintln(w, `tor-dl - fast downloader over Tor (GPLv3)
 Usage: tor-dl [FLAGS] {file.txt | URL [URL2...]}
-  -allow-http
-  -circuits, -c
-  -destination, -d
-  -force
-  -min-lifetime, -l
-  -name, -n
-  -quiet, -q
-  -silent, -s
-  -tor-port, -p
-  -verbose, -v
-  -segment-size         Initial segment size in bytes (default 2MiB)
-  -max-retries          Per-segment retries before splitting or giving up (default 5)`
-		fmt.Fprintln(w, msg)
+  -c, -circuits N          concurrent workers (default 20)
+  -ports "9050,9150"       list of Tor SOCKS ports
+  -p, -tor-port N          single Tor SOCKS port (default 9050)
+  -rps N                   global requests/sec limit (default 8)
+  -segment-size BYTES      initial segment size (default 2MiB)
+  -max-retries N           retries before split/requeue (default 5)
+  -tail-threshold BYTES    when remaining <= threshold, enter tail-mode
+  -tail-workers N          parallel workers in tail-mode (default 4)
+  -tail-shard-min BYTES    min shard size in tail (default 256KiB)
+  -tail-shard-max BYTES    max shard size in tail (default 2MiB)
+  -user-agent STR          UA header (default Chrome UA)
+  -referer URL             Referer header (default YT)
+  -v, -verbose             verbose diagnostics
+  -q, -quiet / -s, -silent mutes output`)
 	}
 }
 
@@ -238,8 +300,7 @@ func main() {
 		flag.Usage()
 		os.Exit(0)
 	}
-
-	// configure writers based on verbosity flags
+	// writers
 	if quiet || silent {
 		messageWriter = io.Discard
 		if silent {
@@ -252,7 +313,7 @@ func main() {
 		errorWriter = os.Stderr
 	}
 
-	// collect URLs either from a file or directly from the CLI
+	// collect URLs (file or args)
 	var uris []string
 	if flag.NArg() == 1 {
 		if _, err := os.Stat(flag.Arg(0)); err == nil {
@@ -275,7 +336,6 @@ func main() {
 	} else {
 		uris = flag.Args()
 	}
-
 	if len(uris) > 1 {
 		fmt.Fprintf(messageWriter, "Downloading %d files.\n", len(uris))
 		if name != "" {
@@ -286,8 +346,26 @@ func main() {
 		fmt.Fprintln(errorWriter, "ERROR: No URLs found.")
 		os.Exit(1)
 	}
+	rand.Seed(time.Now().UnixNano())
 
-	bkgr := context.Background()
+	// parse ports
+	var ports []int
+	if strings.TrimSpace(torPortsCSV) != "" {
+		for _, p := range strings.Split(torPortsCSV, ",") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if n, err := strconv.Atoi(p); err == nil && n > 0 {
+				ports = append(ports, n)
+			}
+		}
+	}
+	if len(ports) == 0 {
+		ports = []int{torPortSingle}
+	}
+
+	ctx := context.Background()
 	for i, uri := range uris {
 		u, err := url.ParseRequestURI(uri)
 		if err != nil {
@@ -301,40 +379,68 @@ func main() {
 			fmt.Fprintf(errorWriter, "ERROR: \"%s\" is not using HTTPS.\n\tUse -allow-http if you must (dangerous).\n", uri)
 			continue
 		}
-		ctx := context.WithoutCancel(bkgr)
-		state := newState(ctx)
+		state := newState(ctx, ports)
 		exitCode := state.Fetch(uri)
+		state.close()
 		if exitCode != 0 {
 			os.Exit(exitCode)
 		}
 	}
 }
 
-// ===== State initialization =====
-func newState(ctx context.Context) *State {
+func newState(ctx context.Context, ports []int) *State {
 	st, _ := os.Stdout.Stat()
 	terminal := st.Mode()&os.ModeCharDevice == os.ModeCharDevice
 
+	if tailThresholdB < 1 {
+		tailThresholdB = 32 * 1024 * 1024
+	}
+	if tailMaxWorkers < 1 {
+		tailMaxWorkers = 1
+	}
+	if retryBaseMs < 50 {
+		retryBaseMs = 50
+	}
+	if rps < 1 {
+		rps = 1
+	}
+	if tailShardMin < 64*1024 {
+		tailShardMin = 64 * 1024
+	}
+	if tailShardMax < tailShardMin {
+		tailShardMax = tailShardMin
+	}
+
 	s := &State{
-		ctx:         ctx,
-		circuits:    circuits,
-		minLifetime: time.Duration(minLifetime) * time.Second,
-		verbose:     verbose,
-		log:         make(chan string, 256),
-		terminal:    terminal,
-		minSegSize:  256 * 1024, // segments smaller than this are not worth using
-		segSize:     cliSegmentSize,
-		maxRetries:  cliMaxRetries,
+		ctx:           ctx,
+		circuits:      circuits,
+		minLifetime:   time.Duration(minLifetime) * time.Second,
+		verbose:       verbose,
+		log:           make(chan string, 2048),
+		terminal:      terminal,
+		minSegSize:    256 * 1024,
+		segSize:       cliSegmentSize,
+		maxRetries:    cliMaxRetries,
+		ua:            userAgent,
+		ref:           referer,
+		tailThreshold: tailThresholdB,
+		tailWorkers:   tailMaxWorkers,
+		retryBase:     time.Duration(retryBaseMs) * time.Millisecond,
+		ports:         ports,
+		rl:            newRateLimiter(rps),
+		startTime:     time.Now(),
 	}
 	if s.segSize < s.minSegSize {
 		s.segSize = s.minSegSize
 	}
 	return s
 }
+func (s *State) close() {
+	if s.rl != nil {
+		s.rl.close()
+	}
+}
 
-// printPermanent writes a line of text on the terminal and moves to the next
-// line if running interactively, otherwise it just prints normally. This is
-// used for final status messages.
 func (s *State) printPermanent(txt string) {
 	if s.terminal {
 		fmt.Fprintf(messageWriter, "\r%-80s\n", txt)
@@ -342,20 +448,16 @@ func (s *State) printPermanent(txt string) {
 		fmt.Fprintln(messageWriter, txt)
 	}
 }
-
-// printTemporary writes a status message on the current line without moving
-// down. This is used for progress updates when a terminal is detected.
 func (s *State) printTemporary(txt string) {
 	if s.terminal {
 		fmt.Fprintf(messageWriter, "\r%-80s", txt)
 	}
 }
+func (s *State) stampf(format string, args ...any) {
+	now := time.Now().Format("15:04:05")
+	s.printPermanent("[" + now + "] " + fmt.Sprintf(format, args...))
+}
 
-// getOutputFilepath determines the final output filename. If the user
-// provided -name, that name is used. Otherwise the name is derived
-// from the URL path. If the destination directory doesn't exist,
-// it will be created if -force is set, otherwise the current
-// directory is used.
 func (s *State) getOutputFilepath() {
 	if _, err := os.Stat(destination); errors.Is(err, fs.ErrNotExist) {
 		if force {
@@ -387,31 +489,48 @@ func (s *State) getOutputFilepath() {
 	s.output = filepath.Join(destination, filename)
 }
 
-// headInfo performs an HTTP HEAD request to discover the content
-// length and whether the server advertises support for byte-range
-// requests. It returns ok=false on error.
+// ---- HEAD + fallback probe ----
 func (s *State) headInfo(client *http.Client) (ok bool, contentLength int64, acceptRanges bool) {
 	req, _ := http.NewRequestWithContext(s.ctx, http.MethodHead, s.src, nil)
+	s.setCommonHeaders(req.Header)
+	resp, err := client.Do(req)
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.ContentLength > 0 {
+			ar := strings.ToLower(resp.Header.Get("Accept-Ranges"))
+			return true, resp.ContentLength, strings.Contains(ar, "bytes")
+		}
+	}
+	return s.probeLengthViaRange(client)
+}
+func (s *State) probeLengthViaRange(client *http.Client) (bool, int64, bool) {
+	req, _ := http.NewRequestWithContext(s.ctx, http.MethodGet, s.src, nil)
+	s.setCommonHeaders(req.Header)
+	req.Header.Set("Range", "bytes=0-0")
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Fprintf(errorWriter, "ERROR - HEAD failed (Tor proxy up?): %v\n", err)
+		fmt.Fprintf(errorWriter, "ERROR - probe GET Range 0-0 failed: %v\n", err)
 		return false, 0, false
 	}
 	defer resp.Body.Close()
-	cl := resp.ContentLength
-	ar := strings.ToLower(resp.Header.Get("Accept-Ranges"))
-	accept := strings.Contains(ar, "bytes")
-	if cl <= 0 {
-		fmt.Fprintln(errorWriter, "ERROR - Failed to retrieve content length.")
+	if resp.StatusCode != http.StatusPartialContent {
+		fmt.Fprintf(errorWriter, "ERROR - probe expected 206, got %d\n", resp.StatusCode)
 		return false, 0, false
 	}
-	return true, cl, accept
+	cr := resp.Header.Get("Content-Range") // "bytes 0-0/12345"
+	total := int64(0)
+	if parts := strings.Split(cr, "/"); len(parts) == 2 {
+		t := strings.TrimSpace(parts[1])
+		if n, err := strconv.ParseInt(t, 10, 64); err == nil {
+			total = n
+		}
+	}
+	if total <= 0 {
+		return false, 0, false
+	}
+	return true, total, true
 }
 
-// Fetch orchestrates the download of a single URL. It sets up
-// output files, performs the HEAD request, and either downloads
-// using a single stream or performs a segmented download when the
-// server supports Range requests.
 func (s *State) Fetch(src string) int {
 	s.src = src
 	s.getOutputFilepath()
@@ -422,18 +541,15 @@ func (s *State) Fetch(src string) int {
 	}
 	fmt.Fprintf(messageWriter, "Output file:\t\t%s\n", s.output)
 
-	// Use a shared client for the HEAD request. We don't care about
-	// the username here because we aren't establishing circuits yet.
-	headCli := httpClient("tordl")
+	headCli := httpClient("tordl", s.ports[0])
 	ok, cl, acceptRanges := s.headInfo(headCli)
-	if !ok {
+	if !ok || cl <= 0 {
 		return 1
 	}
 	s.totalSize = cl
 	s.acceptRanges = acceptRanges
 	fmt.Fprintf(messageWriter, "Download filesize:\t%s\n", humanReadableSize(float64(s.totalSize)))
 
-	// Create/truncate the output file now
 	f, err := os.Create(s.output)
 	if f != nil {
 		_ = f.Close()
@@ -446,59 +562,29 @@ func (s *State) Fetch(src string) int {
 		fmt.Fprintf(messageWriter, "WARNING: Truncate failed: %v\n", err)
 	}
 
-	startTime := time.Now()
+	s.startTime = time.Now()
 
-	// Fallback to single-stream download if the server does not
-	// advertise support for Range requests, or when the file is too
-	// small to warrant segmentation, or when the number of circuits
-	// is below two. In these situations segmented downloads are
-	// unlikely to provide any benefit and can even hurt performance.
-	if !s.acceptRanges || s.totalSize < s.segSize*2 || s.circuits < 2 {
+	if (!s.acceptRanges && s.totalSize < s.segSize*2) || s.circuits < 2 {
 		if !quiet && !silent {
-			fmt.Fprintln(messageWriter, "NOTE: server doesn't advertise Range; downloading single stream.")
+			fmt.Fprintln(messageWriter, "NOTE: single stream mode.")
 		}
 		code := s.singleStream()
 		if code == 0 {
-			howLong := time.Since(startTime)
+			howLong := time.Since(s.startTime)
 			avg := float64(s.totalSize) / howLong.Seconds()
 			s.printPermanent(fmt.Sprintf("Download completed in:\t%s (%s/s)", howLong.Round(time.Second), humanReadableSize(avg)))
 		}
 		return code
 	}
 
-	// ----- segmented download -----
-	// Compute an appropriate segment size. We honour the CLI flag
-	// but ensure it is at least minSegSize. A smaller segment size
-	// produces more segments and therefore more opportunities for
-	// parallelism. However, extremely small segments increase
-	// overhead. The caller can override via -segment-size.
+	// segmented
 	seg := s.segSize
 	if seg < s.minSegSize {
 		seg = s.minSegSize
 	}
-
-	// Compute how many segments we will need to cover the entire file
-	// using this segment size. We round up so that any remainder at
-	// the end of the file becomes its own segment. We cap the
-	// resulting number at MaxInt to prevent overflow in extreme
-	// circumstances (e.g. extremely large downloads on a 32‑bit
-	// system), although such cases are unlikely.
-	nSegments := int64(1)
-	if seg > 0 {
-		nSegments = (s.totalSize + seg - 1) / seg
-	}
-
-	// If there are fewer segments than we have circuits, we reduce
-	// the segment size further so that every circuit can stay busy.
-	// We aim for at least circuits*8 segments. This factor (8) was
-	// chosen empirically: it yields enough work to absorb varying
-	// segment completion times without creating an excessive number
-	// of tiny segments. Users can adjust -segment-size on the CLI
-	// to further influence the number of segments created.
-	minDesired := int64(s.circuits * 8)
+	nSegments := (s.totalSize + seg - 1) / seg
+	minDesired := int64(s.circuits * 6)
 	if nSegments < minDesired {
-		// new segment size = totalSize / desired, rounded up
-		// ensure we respect minSegSize
 		newSeg := s.totalSize / minDesired
 		if s.totalSize%minDesired != 0 {
 			newSeg++
@@ -507,54 +593,24 @@ func (s *State) Fetch(src string) int {
 			newSeg = s.minSegSize
 		}
 		seg = newSeg
-		// recompute number of segments with this new size
 		nSegments = (s.totalSize + seg - 1) / seg
 	}
-
-	// Remember the chosen segment size in the state so workers
-	// know how large each segment is. In the event of retries and
-	// dynamic splitting, this value serves as a baseline.
 	s.segSize = seg
 
-	// Create a work queue capable of holding all segments plus a
-	// small buffer. Without a large enough buffer, adding all
-	// segments to the queue before starting workers could block.
-	// We allocate nSegments plus twice the number of circuits to
-	// ensure there is room for new segments that might be created
-	// during error handling (splitting) without blocking the
-	// producers.
-	// We clamp the capacity to a reasonable upper bound to avoid
-	// exhausting memory on pathological inputs. A maximum of
-	// 1,000,000 entries corresponds to downloads of roughly
-	// 1,000,000*segmentSize bytes. For typical segment sizes this
-	// covers multi‑terabyte downloads.
 	maxQueueCap := 1_000_000
 	queueCap64 := nSegments + int64(s.circuits*2)
 	if queueCap64 > int64(maxQueueCap) {
 		queueCap64 = int64(maxQueueCap)
 	}
-	queueCap := int(queueCap64)
-	s.queue = newQueue(queueCap)
-
-	// Populate the queue with all segments. We do this up front
-	// instead of lazily generating segments so that workers always
-	// have tasks available. Each segment covers [start, start+length)
-	// bytes of the file. The last segment may be smaller if the
-	// filesize is not an exact multiple of the chosen segment size.
+	s.queue = newQueue(int(queueCap64))
 	s.fillInitialSegments()
 
-	// Start the progress monitoring goroutine if we are not
-	// suppressing output. It prints a status update every second.
 	var stopStatus chan bool
 	if !quiet && !silent {
 		stopStatus = make(chan bool, 1)
 		go s.progressLoop(stopStatus)
 	}
 
-	// Start worker goroutines. Each worker will pick segments from
-	// the queue and download them sequentially. We pass the worker
-	// its numeric ID so it can derive a unique username for the
-	// Tor SOCKS proxy.
 	var wg sync.WaitGroup
 	wg.Add(s.circuits)
 	for i := 0; i < s.circuits; i++ {
@@ -563,35 +619,27 @@ func (s *State) Fetch(src string) int {
 			s.worker(workerID)
 		}(i)
 	}
-
-	// Wait for all workers to finish. When the queue is empty and all
-	// segments have either been successfully downloaded or retried up
-	// to the maximum allowed times, workers will exit.
 	wg.Wait()
 	if !quiet && !silent {
 		stopStatus <- true
 	}
 
-	// Verify that we wrote every byte. If we did not, report the
-	// missing amount and return a non-zero exit code.
 	if atomic.LoadInt64(&s.wroteBytes) != s.totalSize {
 		missed := s.totalSize - atomic.LoadInt64(&s.wroteBytes)
 		fmt.Fprintf(errorWriter, "ERROR: Incomplete download, missing %d bytes.\n", missed)
 		return 1
 	}
-
-	howLong := time.Since(startTime)
+	howLong := time.Since(s.startTime)
 	avg := float64(s.totalSize) / howLong.Seconds()
 	s.printTemporary(strings.Repeat(" ", 80))
 	s.printPermanent(fmt.Sprintf("Download completed in:\t%s (%s/s)", howLong.Round(time.Second), humanReadableSize(avg)))
 	return 0
 }
 
-// singleStream downloads the source URL using a single connection
-// and writes the response body sequentially to the output file.
 func (s *State) singleStream() int {
-	client := httpClient("tg0")
+	client := httpClient("tg0", s.ports[0])
 	req, _ := http.NewRequestWithContext(s.ctx, http.MethodGet, s.src, nil)
+	s.setCommonHeaders(req.Header)
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Fprintf(errorWriter, "ERROR - GET failed: %v\n", err)
@@ -619,97 +667,92 @@ func (s *State) singleStream() int {
 	return 0
 }
 
-// fillInitialSegments populates the queue with segments covering the
-// entire file. Each segment's start offset is aligned on s.segSize
-// boundaries except for the final segment, which may be shorter. We
-// compute the length of each segment based on the pre‑determined
-// s.segSize set during Fetch().
 func (s *State) fillInitialSegments() {
 	seg := s.segSize
 	if seg < s.minSegSize {
 		seg = s.minSegSize
 	}
-	var offset int64 = 0
-	for offset < s.totalSize {
+	var segs []*segment
+	for off := int64(0); off < s.totalSize; off += seg {
 		length := seg
-		remaining := s.totalSize - offset
-		if remaining < length {
-			length = remaining
+		if rem := s.totalSize - off; rem < length {
+			length = rem
 		}
-		s.queue.push(&segment{start: offset, length: length})
-		offset += length
+		segs = append(segs, &segment{start: off, length: length})
+	}
+	// перемешиваем — меньше коррелированных 403 и "хвостовых пробок"
+	rand.Shuffle(len(segs), func(i, j int) { segs[i], segs[j] = segs[j], segs[i] })
+	for _, sg := range segs {
+		s.queue.push(sg)
 	}
 }
 
-// adaptiveFeeder is currently a no‑op. In the original version it
-// attempted to split segments dynamically when the queue became
-// empty. With the new approach we pre‑create sufficient segments
-// up front and size the queue accordingly. If future work calls for
-// further dynamic rebalancing or multi‑URL support, this goroutine
-// can be revisited.
-func (s *State) adaptiveFeeder() {
-	for range time.Tick(5 * time.Second) {
-		if s.queue == nil {
-			return
-		}
-		// No‑op: segments are already created for the entire file.
-	}
-}
-
-// progressLoop periodically updates the user with a summary of how
-// much of the file has been downloaded, the current throughput and
-// an estimated time of arrival. It also drains or prints verbose
-// logs depending on the verbose flag.
 func (s *State) progressLoop(stop <-chan bool) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
+	var stalledSeconds int
 	for {
 		select {
 		case <-stop:
 			return
 		case <-ticker.C:
-			s.progressTick()
+			changed := s.progressTick()
+			if changed {
+				stalledSeconds = 0
+			} else {
+				stalledSeconds++
+			}
+			// если хвост и нет прогресса — подсечь сегменты ещё мельче
+			if stalledSeconds >= 8 { // ~8 секунд тишины
+				s.tryTailBurst()
+				stalledSeconds = 0
+			}
 		}
 	}
 }
 
-// progressTick computes the progress metrics and prints them. It also
-// flushes or drains logs depending on the verbose flag. This
-// function is called once per second by progressLoop().
-func (s *State) progressTick() {
+func (s *State) progressTick() bool {
 	curr := atomic.LoadInt64(&s.wroteBytes)
-	diff := curr - s.prevBytes
-	var msg string
-	if diff <= 0 {
-		msg = "stalled"
-	} else {
-		speed := float64(diff) // bytes/s
-		remain := s.totalSize - curr
-		var etaStr string
-		if speed > 0 {
-			etaSec := float64(remain) / speed
-			eta := time.Duration(math.Round(etaSec)) * time.Second
-			etaStr = fmt.Sprintf("ETA %d:%02d:%02d", int(eta.Hours()), int(eta.Minutes())%60, int(eta.Seconds())%60)
-		} else {
-			etaStr = "ETA --:--:--"
-		}
-		msg = fmt.Sprintf("%s/s, %s", humanReadableSize(speed), etaStr)
+	if curr > s.totalSize {
+		curr = s.totalSize // защита отображения от >100%
 	}
-	status := fmt.Sprintf("%6.2f%% done, %s", 100*float64(curr)/float64(s.totalSize), msg)
+	diff := curr - s.prevBytes
+
+	// печать
+	now := time.Now()
+	elapsed := now.Sub(s.startTime).Round(time.Second)
+	percent := 100 * float64(curr) / float64(s.totalSize)
+	avg := float64(curr) / (elapsed.Seconds() + 1e-6)
+
+	if diff <= 0 {
+		s.stampf("%3.0f%%  +%s (total %s)  %s / %s, avg %s/s",
+			math.Floor(percent),
+			"1s",
+			elapsed,
+			humanReadableSize(float64(curr)),
+			humanReadableSize(float64(s.totalSize)),
+			humanReadableSize(avg),
+		)
+	} else {
+		// diff всегда ~за последнюю секунду
+		s.stampf("%3.0f%%  +1s (total %s)  %s / %s, avg %s/s",
+			math.Floor(percent),
+			elapsed,
+			humanReadableSize(float64(curr)),
+			humanReadableSize(float64(s.totalSize)),
+			humanReadableSize(avg),
+		)
+	}
+
 	if s.verbose {
 		s.flushLogs()
 	} else {
 		s.drainLogs()
 	}
-	s.printTemporary(status)
 	s.prevBytes = curr
+	return diff > 0
 }
 
-// flushLogs prints out any accumulated log messages sorted by their
-// string value and counts duplicates. Sorting ensures that identical
-// messages are grouped together which makes repeated errors more
-// obvious in the output. Logs are only printed when verbose mode
-// is enabled.
 func (s *State) flushLogs() {
 	n := len(s.log)
 	if n == 0 {
@@ -739,23 +782,89 @@ func (s *State) flushLogs() {
 		cnt = 1
 	}
 }
-
-// drainLogs discards all queued log messages. In quiet mode we still
-// want to prevent the log channel from growing without bound.
 func (s *State) drainLogs() {
 	for len(s.log) > 0 {
 		<-s.log
 	}
 }
 
-// worker consumes segments from the queue and downloads each
-// segment. It manages its own Tor circuit lifetime by rotating
-// usernames after the configured minimum lifetime. If a segment
-// fetch fails, it is either retried up to maxRetries or split into
-// smaller segments before being requeued.
+// ===== Tail burst (шардинг хвоста) =====
+
+func (s *State) tryTailBurst() {
+	remaining := s.totalSize - atomic.LoadInt64(&s.wroteBytes)
+	if remaining <= 0 {
+		return
+	}
+	if remaining > s.tailThreshold {
+		return
+	}
+	// если очередь пуста/почти пуста — разрежем текущий сегмент крупнее на шард-кусочки
+	if s.queue.len() > 1 {
+		return
+	}
+	// увеличим количество активных в хвосте
+	if s.tailWorkers < s.circuits {
+		s.tailWorkers = s.circuits
+	}
+
+	// подкинем дополнительные шарды строго фиксированного размера
+	shard := s.segSize / 2
+	if shard < tailShardMin {
+		shard = tailShardMin
+	}
+	if shard > tailShardMax {
+		shard = tailShardMax
+	}
+
+	// если вдруг в очереди лежит 1 большой сегмент — достанем, порежем и вернём шард-пачкой
+	select {
+	case seg := <-s.queue.ch:
+		if seg.length > shard*2 {
+			chunks := splitSegmentInto(seg.start, seg.length, shard)
+			// перемешаем и вернём
+			rand.Shuffle(len(chunks), func(i, j int) { chunks[i], chunks[j] = chunks[j], chunks[i] })
+			for _, c := range chunks {
+				s.queue.push(c)
+			}
+			if s.verbose {
+				s.log <- fmt.Sprintf("Tail-burst: split %d bytes into %d shards of ~%d",
+					seg.length, len(chunks), shard)
+			}
+			return
+		}
+		// маленький — вернём как есть
+		s.queue.push(seg)
+	default:
+		// ничего не было — создадим шард-хвост от (total-wrote) вверх
+		start := s.totalSize - remaining
+		chunks := splitSegmentInto(start, remaining, shard)
+		rand.Shuffle(len(chunks), func(i, j int) { chunks[i], chunks[j] = chunks[j], chunks[i] })
+		for _, c := range chunks {
+			s.queue.push(c)
+		}
+		if s.verbose {
+			s.log <- fmt.Sprintf("Tail-burst: seeded %d shards from tail", len(chunks))
+		}
+	}
+}
+
+func splitSegmentInto(start, length, shard int64) []*segment {
+	var res []*segment
+	for off := int64(0); off < length; off += shard {
+		l := shard
+		if rem := length - off; rem < l {
+			l = rem
+		}
+		res = append(res, &segment{start: start + off, length: l})
+	}
+	return res
+}
+
+// ===== Workers =====
 func (s *State) worker(id int) {
-	usernameBase := fmt.Sprintf("tg%d", id)
-	client := httpClient(usernameBase)
+	port := s.ports[id%len(s.ports)]
+	username := fmt.Sprintf("w%d_%d", id, time.Now().UnixNano())
+	client := httpClient(username, port)
 	lastRotate := time.Now()
 
 	for {
@@ -764,54 +873,120 @@ func (s *State) worker(id int) {
 			return
 		}
 
-		// rotate the circuit periodically
+		// tail-mode: ограничиваем активных, но после tail-burst поднимаем лимит
+		remaining := s.totalSize - atomic.LoadInt64(&s.wroteBytes)
+		useTail := (remaining <= s.tailThreshold)
+		acquired := false
+		if useTail {
+			if atomic.AddInt32(&s.activeTail, 1) <= int32(s.tailWorkers) {
+				acquired = true
+			} else {
+				atomic.AddInt32(&s.activeTail, -1)
+				// Если перегреты, то лучше чуть отложить
+				s.queue.pushDelayed(seg, 150*time.Millisecond)
+				continue
+			}
+		}
+
+		// ротация цепочки
 		if time.Since(lastRotate) >= s.minLifetime {
-			usernameBase = fmt.Sprintf("tg%d_%d", id, time.Now().UnixNano())
-			client = httpClient(usernameBase)
+			username = fmt.Sprintf("w%d_%d", id, time.Now().UnixNano())
+			client = httpClient(username, port)
 			lastRotate = time.Now()
 		}
 
-		// fetch the segment; if it fails we may retry or split
-		if err := s.fetchSegment(client, seg); err != nil {
-			seg.attempt++
-			if seg.attempt <= s.maxRetries {
-				// simply requeue the segment for another attempt
-				s.queue.push(seg)
-			} else {
-				// If we have a particularly troublesome segment, try
-				// splitting it in half to see if that alleviates
-				// congestion on remote servers or mitigates unstable
-				// Tor circuits. We only split if the segment is
-				// sufficiently large; otherwise we reset the attempt
-				// counter and push the original segment back.
+		err := s.fetchSegment(client, seg)
+
+		if err != nil {
+			// мгновенная ротация на 403/429
+			if hs, ok := err.(*httpStatusError); ok && (hs.code == 403 || hs.code == 429) {
+				username = fmt.Sprintf("w%d_%d", id, time.Now().UnixNano())
+				client = httpClient(username, port)
+				// агрессивный сплит проблемного куска
 				if seg.length > s.minSegSize*2 {
-					half := seg.length / 2
-					left := &segment{start: seg.start, length: half}
-					right := &segment{start: seg.start + half, length: seg.length - half}
-					s.queue.push(left)
-					s.queue.push(right)
-				} else {
-					seg.attempt = 0
-					s.queue.push(seg)
+					shard := seg.length / 2
+					if shard < s.minSegSize {
+						shard = s.minSegSize
+					}
+					left := &segment{start: seg.start, length: shard}
+					right := &segment{start: seg.start + shard, length: seg.length - shard}
+					s.queue.pushDelayed(left, s.retryBase/2)
+					s.queue.pushDelayed(right, s.retryBase/2)
+					if s.verbose {
+						s.log <- fmt.Sprintf("Split-on-403: %d into %d + %d", seg.length, left.length, right.length)
+					}
+					if acquired {
+						atomic.AddInt32(&s.activeTail, -1)
+					}
+					continue
 				}
 			}
-			continue
+			// общий backoff + в дальнейшем обычный сплит
+			delay := s.backoffFor(seg.attempt, err)
+			seg.attempt++
+			if seg.attempt > s.maxRetries && seg.length > s.minSegSize*2 {
+				half := seg.length / 2
+				left := &segment{start: seg.start, length: half}
+				right := &segment{start: seg.start + half, length: seg.length - half}
+				s.queue.pushDelayed(left, delay/2)
+				s.queue.pushDelayed(right, delay/2)
+			} else {
+				s.queue.pushDelayed(seg, delay)
+			}
+		}
+
+		if acquired {
+			atomic.AddInt32(&s.activeTail, -1)
 		}
 	}
 }
 
-// fetchSegment downloads a single segment using an HTTP Range
-// request and writes it to the appropriate offset in the output
-// file. It returns an error if the Range request fails or if
-// writing to the file fails. On partial writes it spawns a new
-// segment for the remainder and accounts for the bytes that were
-// successfully written.
+func (s *State) backoffFor(attempt int, err error) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	base := s.retryBase
+	mult := 1.0
+	if err != nil {
+		if hs, ok := err.(*httpStatusError); ok {
+			if hs.code == 403 || hs.code == 429 {
+				mult = 1.2 // делаем мягче, т.к. сразу сплитим
+			} else if hs.code >= 500 && hs.code < 600 {
+				mult = 1.5
+			}
+		}
+	}
+	delay := time.Duration(float64(base) * math.Pow(2, float64(attempt)) * mult)
+	// режем кап — не держать по 5 сек в хвосте
+	if delay > 2500*time.Millisecond {
+		delay = 2500 * time.Millisecond
+	}
+	j := float64(delay) * (0.75 + rand.Float64()*0.5)
+	return time.Duration(j)
+}
+
+func (s *State) setCommonHeaders(h http.Header) {
+	h.Set("User-Agent", s.ua)
+	if s.ref != "" {
+		h.Set("Referer", s.ref)
+	}
+	h.Set("Accept", "*/*")
+	h.Set("Accept-Language", "en-US,en;q=0.9,ru;q=0.8")
+	h.Set("Origin", "https://www.youtube.com")
+	h.Set("Connection", "keep-alive")
+}
+
 func (s *State) fetchSegment(client *http.Client, seg *segment) error {
-	// create the Range header for this segment
+	// глобальный RPS лимит — берём токен
+	if s.rl != nil && !s.rl.take(s.ctx) {
+		return fmt.Errorf("rps limiter closed")
+	}
+
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", seg.start, seg.start+seg.length-1)
+
 	req, _ := http.NewRequestWithContext(s.ctx, http.MethodGet, s.src, nil)
+	s.setCommonHeaders(req.Header)
 	req.Header.Set("Range", rangeHeader)
-	req.Header.Set("Connection", "close")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -827,11 +1002,10 @@ func (s *State) fetchSegment(client *http.Client, seg *segment) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusPartialContent {
-		// server did not honour Range request, treat as failure
 		if s.verbose {
 			s.log <- fmt.Sprintf("Unexpected HTTP status %d for %s", resp.StatusCode, rangeHeader)
 		}
-		return fmt.Errorf("range not honored: %d", resp.StatusCode)
+		return &httpStatusError{code: resp.StatusCode}
 	}
 
 	file, err := os.OpenFile(s.output, os.O_WRONLY, 0)
@@ -843,22 +1017,26 @@ func (s *State) fetchSegment(client *http.Client, seg *segment) error {
 		return err
 	}
 
-	lim := io.LimitReader(resp.Body, seg.length)
+	var written int64
 	buf := make([]byte, 256*1024)
-	written, err := io.CopyBuffer(file, lim, buf)
+
+	lim := io.LimitReader(resp.Body, seg.length)
+	w, err := io.CopyBuffer(file, lim, buf)
 	if err != nil && !errors.Is(err, io.EOF) {
 		if s.verbose {
 			s.log <- fmt.Sprintf("copy err (%s): %v", rangeHeader, err)
 		}
-		// handle partial write by requeueing the remainder
-		if written > 0 && written < seg.length {
-			remain := seg.length - written
-			s.queue.push(&segment{start: seg.start + written, length: remain, attempt: seg.attempt})
-			atomic.AddInt64(&s.wroteBytes, written)
+		// если частично записали — докинем остаток как новый сегмент
+		if w > 0 && w < seg.length {
+			remain := seg.length - w
+			s.queue.push(&segment{start: seg.start + w, length: remain, attempt: seg.attempt})
+			atomic.AddInt64(&s.wroteBytes, w)
 			return nil
 		}
 		return err
 	}
+	written = w
+
 	atomic.AddInt64(&s.wroteBytes, written)
 	return nil
 }

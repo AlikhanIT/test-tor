@@ -13,7 +13,7 @@ package main
      - Multi-port Tor fanout
      - Shuffled segments (better balance)
      - Time/percent logger
-     - Clean shutdown when done (no 100% spam)
+     - Clean shutdown when done (no 100% spam)  <-- fixed
    GPLv3
 */
 
@@ -174,23 +174,61 @@ type segment struct {
 }
 
 type workQueue struct {
-	ch chan *segment
+	ch     chan *segment
+	mu     sync.Mutex
+	closed bool
+	ctx    context.Context
 }
 
-func newQueue(capacity int) *workQueue { return &workQueue{ch: make(chan *segment, capacity)} }
-func (q *workQueue) push(s *segment)   { q.ch <- s }
+func newQueue(capacity int, ctx context.Context) *workQueue {
+	return &workQueue{ch: make(chan *segment, capacity), ctx: ctx}
+}
+func (q *workQueue) push(s *segment) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return
+	}
+	defer func() { _ = recover() }() // на случай race с close()
+	q.ch <- s
+}
 func (q *workQueue) pop() (*segment, bool) {
 	s, ok := <-q.ch
 	return s, ok
 }
+func (q *workQueue) tryPop() (*segment, bool) { // неблокирующий pop для хвост-планировщика
+	select {
+	case s, ok := <-q.ch:
+		if !ok {
+			return nil, false
+		}
+		return s, true
+	default:
+		return nil, false
+	}
+}
 func (q *workQueue) pushDelayed(s *segment, d time.Duration) {
 	go func() {
-		time.Sleep(d)
-		q.push(s)
+		select {
+		case <-q.ctx.Done():
+			return
+		case <-time.After(d):
+			q.push(s)
+		}
 	}()
 }
-func (q *workQueue) len() int { return len(q.ch) }
-func (q *workQueue) close()   { close(q.ch) }
+func (q *workQueue) len() int {
+	return len(q.ch)
+}
+func (q *workQueue) close() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return
+	}
+	q.closed = true
+	close(q.ch)
+}
 
 // ===== errors =====
 type httpStatusError struct{ code int }
@@ -604,7 +642,7 @@ func (s *State) Fetch(src string) int {
 	if queueCap64 > int64(maxQueueCap) {
 		queueCap64 = int64(maxQueueCap)
 	}
-	s.queue = newQueue(int(queueCap64))
+	s.queue = newQueue(int(queueCap64), s.ctx)
 	s.fillInitialSegments()
 
 	stopStatus := make(chan bool, 1)
@@ -621,7 +659,7 @@ func (s *State) Fetch(src string) int {
 	wg.Wait()
 	stopStatus <- true
 
-	if atomic.LoadInt64(&s.wroteBytes) != s.totalSize {
+	if atomic.LoadInt64(&s.wroteBytes) < s.totalSize {
 		missed := s.totalSize - atomic.LoadInt64(&s.wroteBytes)
 		fmt.Fprintf(errorWriter, "ERROR: Incomplete download, missing %d bytes.\n", missed)
 		return 1
@@ -659,7 +697,7 @@ func (s *State) singleStream() int {
 		fmt.Fprintf(errorWriter, "ERROR - copy: %v\n", err)
 		return 1
 	}
-	atomic.AddInt64(&s.wroteBytes, written)
+	s.addProgress(written)
 	return 0
 }
 
@@ -757,8 +795,7 @@ func (s *State) tailPlannerTick() {
 		shard = tailShardMax
 	}
 	// попробуем взять один крупный сегмент и порезать
-	select {
-	case seg := <-s.queue.ch:
+	if seg, ok := s.queue.tryPop(); ok && seg != nil {
 		if seg.length > shard*2 {
 			chunks := splitSegmentInto(seg.start, seg.length, shard)
 			rand.Shuffle(len(chunks), func(i, j int) { chunks[i], chunks[j] = chunks[j], chunks[i] })
@@ -772,17 +809,17 @@ func (s *State) tailPlannerTick() {
 		}
 		// маленький — вернём как есть
 		s.queue.push(seg)
-	default:
-		// если в очереди совсем пусто — засеем оставшийся хвост «как есть»
-		start := s.totalSize - remaining
-		chunks := splitSegmentInto(start, remaining, shard)
-		rand.Shuffle(len(chunks), func(i, j int) { chunks[i], chunks[j] = chunks[j], chunks[i] })
-		for _, c := range chunks {
-			s.queue.push(c)
-		}
-		if s.verbose {
-			s.log <- fmt.Sprintf("Tail-burst: seeded %d shards for remaining %d", len(chunks), remaining)
-		}
+		return
+	}
+	// если в очереди совсем пусто — засеем оставшийся хвост «как есть»
+	start := s.totalSize - remaining
+	chunks := splitSegmentInto(start, remaining, shard)
+	rand.Shuffle(len(chunks), func(i, j int) { chunks[i], chunks[j] = chunks[j], chunks[i] })
+	for _, c := range chunks {
+		s.queue.push(c)
+	}
+	if s.verbose {
+		s.log <- fmt.Sprintf("Tail-burst: seeded %d shards for remaining %d", len(chunks), remaining)
 	}
 }
 
@@ -835,17 +872,46 @@ func (s *State) drainLogs() {
 
 // ===== graceful finish =====
 func (s *State) maybeFinish() {
-	// условие завершения: все байты записаны, очередь пуста, в полёте ничего
-	if atomic.LoadInt64(&s.wroteBytes) == s.totalSize &&
+	// условие завершения: все байты записаны (>= на случай дубликатов), очередь пуста, в полёте ничего
+	if atomic.LoadInt64(&s.wroteBytes) >= s.totalSize &&
 		s.queue.len() == 0 &&
 		atomic.LoadInt32(&s.inFlight) == 0 {
 		s.finishOnce.Do(func() {
-			// закрываем очередь, останавливаем HTTP
-			s.queue.close()
+			// сначала отменяем контекст — стопаем pushDelayed
 			if s.cancel != nil {
 				s.cancel()
 			}
+			// потом закрываем очередь, чтобы рабочие корректно вышли из pop()
+			if s.queue != nil {
+				s.queue.close()
+			}
 		})
+	}
+}
+
+// ===== progress helper (clamped) =====
+func (s *State) addProgress(n int64) {
+	if n <= 0 {
+		return
+	}
+	for {
+		prev := atomic.LoadInt64(&s.wroteBytes)
+		if prev >= s.totalSize {
+			return
+		}
+		add := n
+		if prev+add > s.totalSize {
+			add = s.totalSize - prev
+			if add < 0 {
+				add = 0
+			}
+		}
+		if add == 0 {
+			return
+		}
+		if atomic.CompareAndSwapInt64(&s.wroteBytes, prev, prev+add) {
+			return
+		}
 	}
 }
 
@@ -858,7 +924,7 @@ func (s *State) worker(id int) {
 
 	for {
 		seg, ok := s.queue.pop()
-		if !ok {
+		if !ok || seg == nil {
 			return
 		}
 		atomic.AddInt32(&s.inFlight, 1)
@@ -1010,11 +1076,11 @@ func (s *State) fetchSegment(client *http.Client, seg *segment) error {
 		if w > 0 && w < seg.length {
 			remain := seg.length - w
 			s.queue.push(&segment{start: seg.start + w, length: remain, attempt: seg.attempt})
-			atomic.AddInt64(&s.wroteBytes, w)
+			s.addProgress(w)
 			return nil
 		}
 		return err
 	}
-	atomic.AddInt64(&s.wroteBytes, w)
+	s.addProgress(w)
 	return nil
 }

@@ -1,3 +1,4 @@
+// tor-dl.go
 package main
 
 /*
@@ -6,12 +7,13 @@ package main
      - Redirect-safe headers
      - Exponential backoff + jitter
      - Global RPS limiter
-     - Tail-mode with sharded tail (no open-ended stall)
+     - Proactive tail-burst sharding (быстрый хвост)
      - Immediate circuit rotate on 403/429
      - Aggressive split on 403/timeout
      - Multi-port Tor fanout
      - Shuffled segments (better balance)
      - Time/percent logger
+     - Clean shutdown when done (no 100% spam)
    GPLv3
 */
 
@@ -54,11 +56,12 @@ var (
 	cliSegmentSize int64
 	cliMaxRetries  int
 
-	userAgent      string
-	referer        string
-	torPortsCSV    string // comma-separated list; if empty, use -p
-	torPortSingle  int    // -p / -tor-port (compat)
-	rps            int
+	userAgent     string
+	referer       string
+	torPortsCSV   string // comma-separated list; if empty, use -p
+	torPortSingle int    // -p / -tor-port (compat)
+	rps           int
+
 	tailThresholdB int64
 	tailMaxWorkers int
 	retryBaseMs    int
@@ -166,7 +169,7 @@ func httpClient(user string, port int) *http.Client {
 // ===== segments & queue =====
 type segment struct {
 	start   int64
-	length  int64 // 0 не используем (open-ended убрали)
+	length  int64
 	attempt int
 }
 
@@ -196,7 +199,9 @@ func (e *httpStatusError) Error() string { return fmt.Sprintf("http %d", e.code)
 
 // ===== State =====
 type State struct {
-	ctx        context.Context
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	src        string
 	output     string
 	totalSize  int64
@@ -229,8 +234,10 @@ type State struct {
 	ports []int
 	rl    *rateLimiter
 
-	// прогресс/лог
 	startTime time.Time
+
+	inFlight   int32
+	finishOnce sync.Once
 }
 
 // ===== CLI init =====
@@ -260,14 +267,14 @@ func init() {
 		"HTTP User-Agent header.")
 	flag.StringVar(&referer, "referer", "https://www.youtube.com/", "HTTP Referer header.")
 
-	// ports: либо -ports "9050,9150", либо одиночный -p/-tor-port 9050
+	// ports
 	flag.StringVar(&torPortsCSV, "ports", "", "Comma-separated Tor SOCKS ports, e.g. \"9050,9150\".")
 	flag.IntVar(&torPortSingle, "tor-port", 9050, "Single Tor SOCKS port (compat).")
 	flag.IntVar(&torPortSingle, "p", 9050, "Single Tor SOCKS port (compat, short).")
 
 	flag.IntVar(&rps, "rps", 8, "Global requests-per-second limit.")
 	flag.Int64Var(&tailThresholdB, "tail-threshold", 32*1024*1024, "Tail-mode threshold, bytes.")
-	flag.IntVar(&tailMaxWorkers, "tail-workers", 4, "Active workers allowed in tail-mode (use >1 to speed tail).")
+	flag.IntVar(&tailMaxWorkers, "tail-workers", 4, "Active workers allowed in tail-mode (upper bound).")
 	flag.IntVar(&retryBaseMs, "retry-base-ms", 250, "Base backoff (ms).")
 
 	flag.Int64Var(&tailShardMin, "tail-shard-min", 256*1024, "Minimal shard size in tail-mode.")
@@ -284,11 +291,11 @@ Usage: tor-dl [FLAGS] {file.txt | URL [URL2...]}
   -segment-size BYTES      initial segment size (default 2MiB)
   -max-retries N           retries before split/requeue (default 5)
   -tail-threshold BYTES    when remaining <= threshold, enter tail-mode
-  -tail-workers N          parallel workers in tail-mode (default 4)
+  -tail-workers N          parallel workers in tail-mode (default 4; autoscaled up to -c)
   -tail-shard-min BYTES    min shard size in tail (default 256KiB)
   -tail-shard-max BYTES    max shard size in tail (default 2MiB)
-  -user-agent STR          UA header (default Chrome UA)
-  -referer URL             Referer header (default YT)
+  -user-agent STR          UA header
+  -referer URL             Referer header
   -v, -verbose             verbose diagnostics
   -q, -quiet / -s, -silent mutes output`)
 	}
@@ -411,8 +418,10 @@ func newState(ctx context.Context, ports []int) *State {
 		tailShardMax = tailShardMin
 	}
 
+	cctx, cancel := context.WithCancel(ctx)
 	s := &State{
-		ctx:           ctx,
+		ctx:           cctx,
+		cancel:        cancel,
 		circuits:      circuits,
 		minLifetime:   time.Duration(minLifetime) * time.Second,
 		verbose:       verbose,
@@ -446,11 +455,6 @@ func (s *State) printPermanent(txt string) {
 		fmt.Fprintf(messageWriter, "\r%-80s\n", txt)
 	} else {
 		fmt.Fprintln(messageWriter, txt)
-	}
-}
-func (s *State) printTemporary(txt string) {
-	if s.terminal {
-		fmt.Fprintf(messageWriter, "\r%-80s", txt)
 	}
 }
 func (s *State) stampf(format string, args ...any) {
@@ -565,9 +569,7 @@ func (s *State) Fetch(src string) int {
 	s.startTime = time.Now()
 
 	if (!s.acceptRanges && s.totalSize < s.segSize*2) || s.circuits < 2 {
-		if !quiet && !silent {
-			fmt.Fprintln(messageWriter, "NOTE: single stream mode.")
-		}
+		fmt.Fprintln(messageWriter, "NOTE: single stream mode.")
 		code := s.singleStream()
 		if code == 0 {
 			howLong := time.Since(s.startTime)
@@ -605,11 +607,8 @@ func (s *State) Fetch(src string) int {
 	s.queue = newQueue(int(queueCap64))
 	s.fillInitialSegments()
 
-	var stopStatus chan bool
-	if !quiet && !silent {
-		stopStatus = make(chan bool, 1)
-		go s.progressLoop(stopStatus)
-	}
+	stopStatus := make(chan bool, 1)
+	go s.progressLoop(stopStatus)
 
 	var wg sync.WaitGroup
 	wg.Add(s.circuits)
@@ -620,9 +619,7 @@ func (s *State) Fetch(src string) int {
 		}(i)
 	}
 	wg.Wait()
-	if !quiet && !silent {
-		stopStatus <- true
-	}
+	stopStatus <- true
 
 	if atomic.LoadInt64(&s.wroteBytes) != s.totalSize {
 		missed := s.totalSize - atomic.LoadInt64(&s.wroteBytes)
@@ -631,7 +628,6 @@ func (s *State) Fetch(src string) int {
 	}
 	howLong := time.Since(s.startTime)
 	avg := float64(s.totalSize) / howLong.Seconds()
-	s.printTemporary(strings.Repeat(" ", 80))
 	s.printPermanent(fmt.Sprintf("Download completed in:\t%s (%s/s)", howLong.Round(time.Second), humanReadableSize(avg)))
 	return 0
 }
@@ -680,7 +676,6 @@ func (s *State) fillInitialSegments() {
 		}
 		segs = append(segs, &segment{start: off, length: length})
 	}
-	// перемешиваем — меньше коррелированных 403 и "хвостовых пробок"
 	rand.Shuffle(len(segs), func(i, j int) { segs[i], segs[j] = segs[j], segs[i] })
 	for _, sg := range segs {
 		s.queue.push(sg)
@@ -690,51 +685,38 @@ func (s *State) fillInitialSegments() {
 func (s *State) progressLoop(stop <-chan bool) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-	var stalledSeconds int
 	for {
 		select {
 		case <-stop:
 			return
 		case <-ticker.C:
-			changed := s.progressTick()
-			if changed {
-				stalledSeconds = 0
-			} else {
-				stalledSeconds++
-			}
-			// если хвост и нет прогресса — подсечь сегменты ещё мельче
-			if stalledSeconds >= 8 { // ~8 секунд тишины
-				s.tryTailBurst()
-				stalledSeconds = 0
-			}
+			s.progressTick()
+			s.tailPlannerTick() // проактивно держим много шардов под конец
+			s.maybeFinish()     // на всякий случай проверяем условие завершения
 		}
 	}
 }
 
-func (s *State) progressTick() bool {
+func (s *State) progressTick() {
 	curr := atomic.LoadInt64(&s.wroteBytes)
 	if curr > s.totalSize {
-		curr = s.totalSize // защита отображения от >100%
+		curr = s.totalSize
 	}
 	diff := curr - s.prevBytes
 
-	// печать
-	now := time.Now()
-	elapsed := now.Sub(s.startTime).Round(time.Second)
+	elapsed := time.Since(s.startTime).Round(time.Second)
 	percent := 100 * float64(curr) / float64(s.totalSize)
-	avg := float64(curr) / (elapsed.Seconds() + 1e-6)
+	avg := float64(curr) / (float64(elapsed) / float64(time.Second))
 
 	if diff <= 0 {
-		s.stampf("%3.0f%%  +%s (total %s)  %s / %s, avg %s/s",
+		s.stampf("%3.0f%%  +1s (total %s)  %s / %s, avg %s/s",
 			math.Floor(percent),
-			"1s",
 			elapsed,
 			humanReadableSize(float64(curr)),
 			humanReadableSize(float64(s.totalSize)),
 			humanReadableSize(avg),
 		)
 	} else {
-		// diff всегда ~за последнюю секунду
 		s.stampf("%3.0f%%  +1s (total %s)  %s / %s, avg %s/s",
 			math.Floor(percent),
 			elapsed,
@@ -750,7 +732,70 @@ func (s *State) progressTick() bool {
 		s.drainLogs()
 	}
 	s.prevBytes = curr
-	return diff > 0
+}
+
+// планировщик хвоста — всегда держим достаточно шардов и поднимаем tail-concurrency
+func (s *State) tailPlannerTick() {
+	remaining := s.totalSize - atomic.LoadInt64(&s.wroteBytes)
+	if remaining <= 0 || remaining > s.tailThreshold {
+		return
+	}
+	// поднимем конкуренцию хвоста до -c
+	if s.tailWorkers < s.circuits {
+		s.tailWorkers = s.circuits
+	}
+	// если в очереди мало задач — насыпем шардов
+	want := s.tailWorkers * 2
+	if s.queue.len() >= want {
+		return
+	}
+	shard := s.segSize / 2
+	if shard < tailShardMin {
+		shard = tailShardMin
+	}
+	if shard > tailShardMax {
+		shard = tailShardMax
+	}
+	// попробуем взять один крупный сегмент и порезать
+	select {
+	case seg := <-s.queue.ch:
+		if seg.length > shard*2 {
+			chunks := splitSegmentInto(seg.start, seg.length, shard)
+			rand.Shuffle(len(chunks), func(i, j int) { chunks[i], chunks[j] = chunks[j], chunks[i] })
+			for _, c := range chunks {
+				s.queue.push(c)
+			}
+			if s.verbose {
+				s.log <- fmt.Sprintf("Tail-burst: split %d bytes into %d shards of ~%d", seg.length, len(chunks), shard)
+			}
+			return
+		}
+		// маленький — вернём как есть
+		s.queue.push(seg)
+	default:
+		// если в очереди совсем пусто — засеем оставшийся хвост «как есть»
+		start := s.totalSize - remaining
+		chunks := splitSegmentInto(start, remaining, shard)
+		rand.Shuffle(len(chunks), func(i, j int) { chunks[i], chunks[j] = chunks[j], chunks[i] })
+		for _, c := range chunks {
+			s.queue.push(c)
+		}
+		if s.verbose {
+			s.log <- fmt.Sprintf("Tail-burst: seeded %d shards for remaining %d", len(chunks), remaining)
+		}
+	}
+}
+
+func splitSegmentInto(start, length, shard int64) []*segment {
+	var res []*segment
+	for off := int64(0); off < length; off += shard {
+		l := shard
+		if rem := length - off; rem < l {
+			l = rem
+		}
+		res = append(res, &segment{start: start + off, length: l})
+	}
+	return res
 }
 
 func (s *State) flushLogs() {
@@ -788,76 +833,20 @@ func (s *State) drainLogs() {
 	}
 }
 
-// ===== Tail burst (шардинг хвоста) =====
-
-func (s *State) tryTailBurst() {
-	remaining := s.totalSize - atomic.LoadInt64(&s.wroteBytes)
-	if remaining <= 0 {
-		return
-	}
-	if remaining > s.tailThreshold {
-		return
-	}
-	// если очередь пуста/почти пуста — разрежем текущий сегмент крупнее на шард-кусочки
-	if s.queue.len() > 1 {
-		return
-	}
-	// увеличим количество активных в хвосте
-	if s.tailWorkers < s.circuits {
-		s.tailWorkers = s.circuits
-	}
-
-	// подкинем дополнительные шарды строго фиксированного размера
-	shard := s.segSize / 2
-	if shard < tailShardMin {
-		shard = tailShardMin
-	}
-	if shard > tailShardMax {
-		shard = tailShardMax
-	}
-
-	// если вдруг в очереди лежит 1 большой сегмент — достанем, порежем и вернём шард-пачкой
-	select {
-	case seg := <-s.queue.ch:
-		if seg.length > shard*2 {
-			chunks := splitSegmentInto(seg.start, seg.length, shard)
-			// перемешаем и вернём
-			rand.Shuffle(len(chunks), func(i, j int) { chunks[i], chunks[j] = chunks[j], chunks[i] })
-			for _, c := range chunks {
-				s.queue.push(c)
+// ===== graceful finish =====
+func (s *State) maybeFinish() {
+	// условие завершения: все байты записаны, очередь пуста, в полёте ничего
+	if atomic.LoadInt64(&s.wroteBytes) == s.totalSize &&
+		s.queue.len() == 0 &&
+		atomic.LoadInt32(&s.inFlight) == 0 {
+		s.finishOnce.Do(func() {
+			// закрываем очередь, останавливаем HTTP
+			s.queue.close()
+			if s.cancel != nil {
+				s.cancel()
 			}
-			if s.verbose {
-				s.log <- fmt.Sprintf("Tail-burst: split %d bytes into %d shards of ~%d",
-					seg.length, len(chunks), shard)
-			}
-			return
-		}
-		// маленький — вернём как есть
-		s.queue.push(seg)
-	default:
-		// ничего не было — создадим шард-хвост от (total-wrote) вверх
-		start := s.totalSize - remaining
-		chunks := splitSegmentInto(start, remaining, shard)
-		rand.Shuffle(len(chunks), func(i, j int) { chunks[i], chunks[j] = chunks[j], chunks[i] })
-		for _, c := range chunks {
-			s.queue.push(c)
-		}
-		if s.verbose {
-			s.log <- fmt.Sprintf("Tail-burst: seeded %d shards from tail", len(chunks))
-		}
+		})
 	}
-}
-
-func splitSegmentInto(start, length, shard int64) []*segment {
-	var res []*segment
-	for off := int64(0); off < length; off += shard {
-		l := shard
-		if rem := length - off; rem < l {
-			l = rem
-		}
-		res = append(res, &segment{start: start + off, length: l})
-	}
-	return res
 }
 
 // ===== Workers =====
@@ -872,72 +861,66 @@ func (s *State) worker(id int) {
 		if !ok {
 			return
 		}
+		atomic.AddInt32(&s.inFlight, 1)
+		// ensure inFlight always decremented
+		func() {
+			defer func() {
+				atomic.AddInt32(&s.inFlight, -1)
+				s.maybeFinish()
+			}()
 
-		// tail-mode: ограничиваем активных, но после tail-burst поднимаем лимит
-		remaining := s.totalSize - atomic.LoadInt64(&s.wroteBytes)
-		useTail := (remaining <= s.tailThreshold)
-		acquired := false
-		if useTail {
-			if atomic.AddInt32(&s.activeTail, 1) <= int32(s.tailWorkers) {
-				acquired = true
-			} else {
-				atomic.AddInt32(&s.activeTail, -1)
-				// Если перегреты, то лучше чуть отложить
-				s.queue.pushDelayed(seg, 150*time.Millisecond)
-				continue
+			// tail-mode: авто-скейл
+			remaining := s.totalSize - atomic.LoadInt64(&s.wroteBytes)
+			useTail := (remaining <= s.tailThreshold)
+			if useTail && s.tailWorkers < s.circuits {
+				s.tailWorkers = s.circuits
 			}
-		}
 
-		// ротация цепочки
-		if time.Since(lastRotate) >= s.minLifetime {
-			username = fmt.Sprintf("w%d_%d", id, time.Now().UnixNano())
-			client = httpClient(username, port)
-			lastRotate = time.Now()
-		}
-
-		err := s.fetchSegment(client, seg)
-
-		if err != nil {
-			// мгновенная ротация на 403/429
-			if hs, ok := err.(*httpStatusError); ok && (hs.code == 403 || hs.code == 429) {
+			// ротация цепочки
+			if time.Since(lastRotate) >= s.minLifetime {
 				username = fmt.Sprintf("w%d_%d", id, time.Now().UnixNano())
 				client = httpClient(username, port)
-				// агрессивный сплит проблемного куска
-				if seg.length > s.minSegSize*2 {
-					shard := seg.length / 2
-					if shard < s.minSegSize {
-						shard = s.minSegSize
-					}
-					left := &segment{start: seg.start, length: shard}
-					right := &segment{start: seg.start + shard, length: seg.length - shard}
-					s.queue.pushDelayed(left, s.retryBase/2)
-					s.queue.pushDelayed(right, s.retryBase/2)
-					if s.verbose {
-						s.log <- fmt.Sprintf("Split-on-403: %d into %d + %d", seg.length, left.length, right.length)
-					}
-					if acquired {
-						atomic.AddInt32(&s.activeTail, -1)
-					}
-					continue
-				}
+				lastRotate = time.Now()
 			}
-			// общий backoff + в дальнейшем обычный сплит
-			delay := s.backoffFor(seg.attempt, err)
-			seg.attempt++
-			if seg.attempt > s.maxRetries && seg.length > s.minSegSize*2 {
-				half := seg.length / 2
-				left := &segment{start: seg.start, length: half}
-				right := &segment{start: seg.start + half, length: seg.length - half}
-				s.queue.pushDelayed(left, delay/2)
-				s.queue.pushDelayed(right, delay/2)
-			} else {
-				s.queue.pushDelayed(seg, delay)
-			}
-		}
 
-		if acquired {
-			atomic.AddInt32(&s.activeTail, -1)
-		}
+			err := s.fetchSegment(client, seg)
+
+			if err != nil {
+				// мгновенная ротация на 403/429
+				if hs, ok := err.(*httpStatusError); ok && (hs.code == 403 || hs.code == 429) {
+					username = fmt.Sprintf("w%d_%d", id, time.Now().UnixNano())
+					client = httpClient(username, port)
+					// агрессивный сплит проблемного куска
+					if seg.length > s.minSegSize*2 {
+						shard := seg.length / 2
+						if shard < s.minSegSize {
+							shard = s.minSegSize
+						}
+						left := &segment{start: seg.start, length: shard}
+						right := &segment{start: seg.start + shard, length: seg.length - shard}
+						s.queue.pushDelayed(left, s.retryBase/2)
+						s.queue.pushDelayed(right, s.retryBase/2)
+						if s.verbose {
+							s.log <- fmt.Sprintf("Split-on-403: %d into %d + %d", seg.length, left.length, right.length)
+						}
+						return
+					}
+				}
+				// общий backoff + в дальнейшем обычный сплит
+				delay := s.backoffFor(seg.attempt, err)
+				seg.attempt++
+				if seg.attempt > s.maxRetries && seg.length > s.minSegSize*2 {
+					half := seg.length / 2
+					left := &segment{start: seg.start, length: half}
+					right := &segment{start: seg.start + half, length: seg.length - half}
+					s.queue.pushDelayed(left, delay/2)
+					s.queue.pushDelayed(right, delay/2)
+				} else {
+					s.queue.pushDelayed(seg, delay)
+				}
+				return
+			}
+		}()
 	}
 }
 
@@ -950,14 +933,13 @@ func (s *State) backoffFor(attempt int, err error) time.Duration {
 	if err != nil {
 		if hs, ok := err.(*httpStatusError); ok {
 			if hs.code == 403 || hs.code == 429 {
-				mult = 1.2 // делаем мягче, т.к. сразу сплитим
+				mult = 1.2 // мягче, мы ещё и сплитим
 			} else if hs.code >= 500 && hs.code < 600 {
 				mult = 1.5
 			}
 		}
 	}
 	delay := time.Duration(float64(base) * math.Pow(2, float64(attempt)) * mult)
-	// режем кап — не держать по 5 сек в хвосте
 	if delay > 2500*time.Millisecond {
 		delay = 2500 * time.Millisecond
 	}
@@ -1017,9 +999,7 @@ func (s *State) fetchSegment(client *http.Client, seg *segment) error {
 		return err
 	}
 
-	var written int64
 	buf := make([]byte, 256*1024)
-
 	lim := io.LimitReader(resp.Body, seg.length)
 	w, err := io.CopyBuffer(file, lim, buf)
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -1035,8 +1015,6 @@ func (s *State) fetchSegment(client *http.Client, seg *segment) error {
 		}
 		return err
 	}
-	written = w
-
-	atomic.AddInt64(&s.wroteBytes, written)
+	atomic.AddInt64(&s.wroteBytes, w)
 	return nil
 }

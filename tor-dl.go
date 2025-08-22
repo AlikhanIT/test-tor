@@ -886,10 +886,17 @@ func (s *State) progressLoop(stop <-chan bool) {
 		select {
 		case <-stop:
 			return
+		case <-s.ctx.Done():
+			return
 		case <-ticker.C:
+			// если уже всё собрано — мгновенно завершаемся, без лишних «100%»
+			if atomic.LoadInt64(&s.wroteBytes) >= s.totalSize {
+				s.maybeFinish()
+				return
+			}
 			s.progressTick()
-			s.tailPlannerTick() // проактивно держим много шардов под конец
-			s.maybeFinish()     // на всякий случай проверяем условие завершения
+			s.tailPlannerTick()
+			s.maybeFinish()
 		}
 	}
 }
@@ -1031,18 +1038,13 @@ func (s *State) drainLogs() {
 
 // ===== graceful finish =====
 func (s *State) maybeFinish() {
-	// условие завершения: все байты записаны (>= на случай дубликатов), очередь пуста, в полёте ничего
-	if atomic.LoadInt64(&s.wroteBytes) >= s.totalSize &&
-		s.queue.len() == 0 &&
-		atomic.LoadInt32(&s.inFlight) == 0 {
+	if atomic.LoadInt64(&s.wroteBytes) >= s.totalSize {
 		s.finishOnce.Do(func() {
-			// сначала отменяем контекст — стопаем pushDelayed
 			if s.cancel != nil {
-				s.cancel()
+				s.cancel() // отменяем все отложенные пуши и текущие запросы
 			}
-			// потом закрываем очередь, чтобы рабочие корректно вышли из pop()
 			if s.queue != nil {
-				s.queue.close()
+				s.queue.close() // закрываем очередь, воркеры сразу выйдут из pop()
 			}
 		})
 	}
@@ -1082,33 +1084,46 @@ func (s *State) worker(id int) {
 	lastRotate := time.Now()
 
 	for {
+		// быстрый выход, если уже всё скачано
+		if atomic.LoadInt64(&s.wroteBytes) >= s.totalSize {
+			return
+		}
+
 		seg, ok := s.queue.pop()
 		if !ok || seg == nil {
 			return
 		}
+
+		// ещё одна защита: если вдруг между pop и началом работы мы уже добили 100%
+		if atomic.LoadInt64(&s.wroteBytes) >= s.totalSize {
+			return
+		}
+
 		atomic.AddInt32(&s.inFlight, 1)
-		// ensure inFlight always decremented
 		func() {
 			defer func() {
 				atomic.AddInt32(&s.inFlight, -1)
 				s.maybeFinish()
 			}()
 
-			// ротация цепочки
+			// ротация цепочки по времени
 			if time.Since(lastRotate) >= s.minLifetime {
 				username = fmt.Sprintf("w%d_%d", id, time.Now().UnixNano())
 				client = httpClient(username, port)
 				lastRotate = time.Now()
 			}
 
-			err := s.fetchSegment(client, seg)
+			// если уже добили 100% — не делаем запрос
+			if atomic.LoadInt64(&s.wroteBytes) >= s.totalSize || s.ctx.Err() != nil {
+				return
+			}
 
+			err := s.fetchSegment(client, seg)
+			// ... остальное без изменений ...
 			if err != nil {
-				// мгновенная ротация на 403/429
 				if hs, ok := err.(*httpStatusError); ok && (hs.code == 403 || hs.code == 429) {
 					username = fmt.Sprintf("w%d_%d", id, time.Now().UnixNano())
 					client = httpClient(username, port)
-					// агрессивный сплит проблемного куска
 					if seg.length > s.minSegSize*2 {
 						shard := seg.length / 2
 						if shard < s.minSegSize {
@@ -1124,9 +1139,12 @@ func (s *State) worker(id int) {
 						return
 					}
 				}
-				// общий backoff + в дальнейшем обычный сплит
 				delay := s.backoffFor(seg.attempt, err)
 				seg.attempt++
+				// не ре-кьюим, если уже 100% или контекст отменён
+				if atomic.LoadInt64(&s.wroteBytes) >= s.totalSize || s.ctx.Err() != nil {
+					return
+				}
 				if seg.attempt > s.maxRetries && seg.length > s.minSegSize*2 {
 					half := seg.length / 2
 					left := &segment{start: seg.start, length: half}
@@ -1177,13 +1195,15 @@ func (s *State) setCommonHeaders(h http.Header) {
 }
 
 func (s *State) fetchSegment(client *http.Client, seg *segment) error {
-	// глобальный RPS лимит — берём токен
 	if s.rl != nil && !s.rl.take(s.ctx) {
 		return fmt.Errorf("rps limiter closed")
 	}
+	// быстрая отмена
+	if s.ctx.Err() != nil || atomic.LoadInt64(&s.wroteBytes) >= s.totalSize {
+		return nil
+	}
 
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", seg.start, seg.start+seg.length-1)
-
 	req, _ := http.NewRequestWithContext(s.ctx, http.MethodGet, s.src, nil)
 	s.setCommonHeaders(req.Header)
 	req.Header.Set("Range", rangeHeader)
@@ -1223,23 +1243,24 @@ func (s *State) fetchSegment(client *http.Client, seg *segment) error {
 		if s.verbose {
 			s.log <- fmt.Sprintf("copy err (%s): %v", rangeHeader, err)
 		}
-		// если частично записали — докинем остаток как новый сегмент
 		if w > 0 && w < seg.length {
 			remain := seg.length - w
-			s.queue.push(&segment{start: seg.start + w, length: remain, attempt: seg.attempt})
 			s.addProgress(w)
+			// дозапланируем остаток только если ещё не добили 100%
+			if atomic.LoadInt64(&s.wroteBytes) < s.totalSize && s.ctx.Err() == nil {
+				s.queue.push(&segment{start: seg.start + w, length: remain, attempt: seg.attempt})
+			}
 			return nil
 		}
 		return err
 	}
 
-	// короткое чтение без ошибки (ранний EOF) — дозагружаем остаток
 	if w < seg.length {
 		remain := seg.length - w
 		if w > 0 {
 			s.addProgress(w)
 		}
-		if remain > 0 {
+		if remain > 0 && atomic.LoadInt64(&s.wroteBytes) < s.totalSize && s.ctx.Err() == nil {
 			s.queue.push(&segment{start: seg.start + w, length: remain, attempt: seg.attempt})
 		}
 		return nil

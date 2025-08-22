@@ -39,8 +39,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"golang.org/x/net/proxy"
 )
 
 // ===== CLI flags =====
@@ -128,34 +126,19 @@ func (rl *rateLimiter) take(ctx context.Context) bool {
 }
 func (rl *rateLimiter) close() { close(rl.stop) }
 
-// ===== HTTP client factory (SOCKS5 over Tor) =====
+// HTTP client через SOCKS5 (Tor) без внешних зависимостей
 func httpClient(user string, port int) *http.Client {
-	auth := &proxy.Auth{User: user, Password: user}
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", port)
-
 	base := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
-
-	// Пытаемся с аутентификацией (для изоляции), при неудаче — без неё
-	socks5Dialer, err := proxy.SOCKS5("tcp", socksAddr, auth, base)
-	if err != nil {
-		socks5Dialer, err = proxy.SOCKS5("tcp", socksAddr, nil, base)
-		if err != nil {
-			fmt.Fprintf(errorWriter, "ERROR - SOCKS5 dialer to %s: %v\n", socksAddr, err)
-			os.Exit(1)
-		}
-	}
-
-	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return socks5Dialer.Dial(network, addr)
-	}
+	dialCtx := socks5DialContext(socksAddr, user, user, base)
 
 	jar, _ := cookiejar.New(nil)
 	tr := &http.Transport{
-		Proxy:               nil, // SOCKS5 используем через DialContext
-		DialContext:         dialContext,
+		Proxy:               nil, // используем SOCKS5 через DialContext
+		DialContext:         dialCtx,
 		MaxIdleConns:        256,
 		MaxIdleConnsPerHost: 128,
 		IdleConnTimeout:     45 * time.Second,
@@ -183,6 +166,155 @@ func httpClient(user string, port int) *http.Client {
 		return nil
 	}
 	return cli
+}
+
+// Минимальный SOCKS5 DialContext с поддержкой no-auth и username/password (RFC1929)
+func socks5DialContext(socksAddr, user, pass string, base *net.Dialer) func(ctx context.Context, network, targetAddr string) (net.Conn, error) {
+	return func(ctx context.Context, network, targetAddr string) (net.Conn, error) {
+		// соединяемся с SOCKS5
+		conn, err := base.DialContext(ctx, "tcp", socksAddr)
+		if err != nil {
+			return nil, fmt.Errorf("socks5 connect: %w", err)
+		}
+		// уважаем дедлайн из контекста на время рукопожатия
+		if dl, ok := ctx.Deadline(); ok {
+			_ = conn.SetDeadline(dl)
+			defer conn.SetDeadline(time.Time{})
+		}
+
+		// greeting: предлагаем no-auth (0x00) и user/pass (0x02)
+		g := []byte{0x05, 0x02, 0x00, 0x02}
+		if _, err := conn.Write(g); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 greeting write: %w", err)
+		}
+		reply := make([]byte, 2)
+		if _, err := io.ReadFull(conn, reply); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 greeting read: %w", err)
+		}
+		if reply[0] != 0x05 {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 bad version: %d", reply[0])
+		}
+		method := reply[1]
+		switch method {
+		case 0x00: // no auth
+			// ничего не делаем
+		case 0x02: // username/password
+			u := []byte(user)
+			p := []byte(pass)
+			if len(u) > 255 || len(p) > 255 {
+				conn.Close()
+				return nil, fmt.Errorf("socks5 auth: username/password too long")
+			}
+			auth := make([]byte, 0, 3+len(u)+len(p))
+			auth = append(auth, 0x01, byte(len(u)))
+			auth = append(auth, u...)
+			auth = append(auth, byte(len(p)))
+			auth = append(auth, p...)
+			if _, err := conn.Write(auth); err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("socks5 auth write: %w", err)
+			}
+			ar := make([]byte, 2)
+			if _, err := io.ReadFull(conn, ar); err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("socks5 auth read: %w", err)
+			}
+			if ar[1] != 0x00 {
+				conn.Close()
+				return nil, fmt.Errorf("socks5 auth failed (code %d)", ar[1])
+			}
+		default:
+			conn.Close()
+			return nil, fmt.Errorf("socks5: no acceptable auth (0x%02x)", method)
+		}
+
+		// формируем CONNECT-запрос
+		host, portStr, err := net.SplitHostPort(targetAddr)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("split host/port: %w", err)
+		}
+		nport, err := strconv.Atoi(portStr)
+		if err != nil || nport < 0 || nport > 65535 {
+			conn.Close()
+			return nil, fmt.Errorf("bad port: %s", portStr)
+		}
+		req := []byte{0x05, 0x01, 0x00} // VER=5, CMD=CONNECT, RSV=0
+
+		if ip := net.ParseIP(host); ip != nil {
+			if v4 := ip.To4(); v4 != nil {
+				req = append(req, 0x01) // IPv4
+				req = append(req, v4...)
+			} else {
+				req = append(req, 0x04) // IPv6
+				req = append(req, ip.To16()...)
+			}
+		} else {
+			if len(host) > 255 {
+				conn.Close()
+				return nil, fmt.Errorf("domain name too long")
+			}
+			req = append(req, 0x03, byte(len(host))) // DOMAIN
+			req = append(req, []byte(host)...)
+		}
+		req = append(req, byte(nport>>8), byte(nport&0xff))
+
+		if _, err := conn.Write(req); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 connect write: %w", err)
+		}
+
+		// читаем ответ: VER REP RSV ATYP [BND.ADDR] [BND.PORT]
+		hdr := make([]byte, 4)
+		if _, err := io.ReadFull(conn, hdr); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 connect read hdr: %w", err)
+		}
+		if hdr[0] != 0x05 {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 bad reply version: %d", hdr[0])
+		}
+		if hdr[1] != 0x00 {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 connect failed (REP=0x%02x)", hdr[1])
+		}
+		var toRead int
+		switch hdr[3] {
+		case 0x01:
+			toRead = 4
+		case 0x04:
+			toRead = 16
+		case 0x03:
+			lb := make([]byte, 1)
+			if _, err := io.ReadFull(conn, lb); err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("socks5 read domain len: %w", err)
+			}
+			toRead = int(lb[0])
+		default:
+			conn.Close()
+			return nil, fmt.Errorf("socks5 bad ATYP: 0x%02x", hdr[3])
+		}
+		// пропускаем адрес + порт
+		if toRead > 0 {
+			dummy := make([]byte, toRead)
+			if _, err := io.ReadFull(conn, dummy); err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("socks5 read bnd.addr: %w", err)
+			}
+		}
+		dport := make([]byte, 2)
+		if _, err := io.ReadFull(conn, dport); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 read bnd.port: %w", err)
+		}
+
+		// успех
+		return conn, nil
+	}
 }
 
 // ===== segments & queue =====

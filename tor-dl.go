@@ -13,7 +13,7 @@ package main
      - Multi-port Tor fanout
      - Shuffled segments (better balance)
      - Time/percent logger
-     - Clean shutdown when done (no 100% spam)  <-- fixed
+     - Clean shutdown when done (no 100% spam)
    GPLv3
 */
 
@@ -724,6 +724,93 @@ func (s *State) probeLengthViaRange(client *http.Client) (bool, int64, bool) {
 	return true, total, true
 }
 
+// ===== New robust Range negotiator =====
+
+// probeRangeOnce делает GET с Range: 0-0 и возвращает:
+// total, acceptRanges==true при 206; status код и err для диагностики
+func (s *State) probeRangeOnce(client *http.Client) (int64, bool, int, error) {
+	req, _ := http.NewRequestWithContext(s.ctx, http.MethodGet, s.src, nil)
+	s.setCommonHeaders(req.Header)
+	req.Header.Set("Range", "bytes=0-0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, false, 0, err
+	}
+	defer resp.Body.Close()
+
+	status := resp.StatusCode
+	if status != http.StatusPartialContent {
+		// Не 206 — возможно 403/429/200 и т.п.
+		return 0, false, status, fmt.Errorf("unexpected status %d", status)
+	}
+
+	// Парсим Content-Range: "bytes 0-0/12345"
+	cr := resp.Header.Get("Content-Range")
+	var total int64
+	if parts := strings.Split(cr, "/"); len(parts) == 2 {
+		t := strings.TrimSpace(parts[1])
+		if n, err := strconv.ParseInt(t, 10, 64); err == nil {
+			total = n
+		}
+	}
+	if total <= 0 {
+		return 0, false, status, fmt.Errorf("bad Content-Range: %q", cr)
+	}
+	return total, true, status, nil
+}
+
+// negotiateHead перебирает порты и добивается успешного 206 на Range 0-0.
+// На 403/429 — меняем порт; на прочие ошибки — пробуем новое имя (изоляция),
+// затем следующий порт. При успехе переносит рабочий порт в начало s.ports.
+func (s *State) negotiateHead() bool {
+	if len(s.ports) == 0 {
+		fmt.Fprintln(errorWriter, "ERROR: no Tor ports configured")
+		return false
+	}
+
+	triesPerPort := 2 // сначала новое имя на этом же порту, потом следующий порт
+	for pi := 0; pi < len(s.ports); pi++ {
+		port := s.ports[pi]
+		for t := 0; t < triesPerPort; t++ {
+			username := fmt.Sprintf("head_%d_%d", port, time.Now().UnixNano())
+			cli := httpClient(username, port)
+
+			total, accept, status, err := s.probeRangeOnce(cli)
+			if err == nil && status == http.StatusPartialContent && total > 0 {
+				s.totalSize = total
+				s.acceptRanges = accept
+
+				// переносим найденный «рабочий» порт в начало списка
+				if pi > 0 {
+					newOrder := make([]int, 0, len(s.ports))
+					newOrder = append(newOrder, port)
+					newOrder = append(newOrder, append([]int(nil), s.ports[:pi]...)...)
+					newOrder = append(newOrder, s.ports[pi+1:]...)
+					s.ports = newOrder
+				}
+				return true
+			}
+
+			// явный бан по порту — сразу следующий порт
+			if status == http.StatusForbidden || status == http.StatusTooManyRequests {
+				if s.verbose {
+					s.log <- fmt.Sprintf("HEAD 403/429 on port %d — switching port", port)
+				}
+				break
+			}
+
+			// иные сбои: попробуем ещё раз с новым именем (изоляция цепочки), затем порт сменим
+			if s.verbose {
+				s.log <- fmt.Sprintf("HEAD probe failed on port %d (try %d/%d): %v (status %d)", port, t+1, triesPerPort, err, status)
+			}
+		}
+	}
+
+	fmt.Fprintln(errorWriter, "ERROR: failed to negotiate initial Range 0-0 on all ports")
+	return false
+}
+
 func (s *State) Fetch(src string) int {
 	s.src = src
 	s.getOutputFilepath()
@@ -734,13 +821,10 @@ func (s *State) Fetch(src string) int {
 	}
 	fmt.Fprintf(messageWriter, "Output file:\t\t%s\n", s.output)
 
-	headCli := httpClient("tordl", s.ports[0])
-	ok, cl, acceptRanges := s.headInfo(headCli)
-	if !ok || cl <= 0 {
+	// --- НОВЫЙ старт: добиться 206 на Range 0-0, при 403/429 менять порт ---
+	if !s.negotiateHead() {
 		return 1
 	}
-	s.totalSize = cl
-	s.acceptRanges = acceptRanges
 	fmt.Fprintf(messageWriter, "Download filesize:\t%s\n", humanReadableSize(float64(s.totalSize)))
 
 	f, err := os.Create(s.output)
@@ -1076,15 +1160,20 @@ func (s *State) addProgress(n int64) {
 	}
 }
 
-// ===== Workers =====
+// ===== Workers (порт-свитч на 403/429) =====
 func (s *State) worker(id int) {
-	port := s.ports[id%len(s.ports)]
+	if len(s.ports) == 0 {
+		return
+	}
+	portIdx := id % len(s.ports)
+	port := s.ports[portIdx]
+
 	username := fmt.Sprintf("w%d_%d", id, time.Now().UnixNano())
 	client := httpClient(username, port)
 	lastRotate := time.Now()
 
 	for {
-		// быстрый выход, если уже всё скачано
+		// быстрый выход
 		if atomic.LoadInt64(&s.wroteBytes) >= s.totalSize {
 			return
 		}
@@ -1094,7 +1183,6 @@ func (s *State) worker(id int) {
 			return
 		}
 
-		// ещё одна защита: если вдруг между pop и началом работы мы уже добили 100%
 		if atomic.LoadInt64(&s.wroteBytes) >= s.totalSize {
 			return
 		}
@@ -1106,24 +1194,32 @@ func (s *State) worker(id int) {
 				s.maybeFinish()
 			}()
 
-			// ротация цепочки по времени
+			// ротация цепочки по времени (на том же порту)
 			if time.Since(lastRotate) >= s.minLifetime {
 				username = fmt.Sprintf("w%d_%d", id, time.Now().UnixNano())
 				client = httpClient(username, port)
 				lastRotate = time.Now()
 			}
 
-			// если уже добили 100% — не делаем запрос
 			if atomic.LoadInt64(&s.wroteBytes) >= s.totalSize || s.ctx.Err() != nil {
 				return
 			}
 
 			err := s.fetchSegment(client, seg)
-			// ... остальное без изменений ...
 			if err != nil {
+				// На 403/429: переключаемся на СЛЕДУЮЩИЙ порт и параллельно сплитим сегмент
 				if hs, ok := err.(*httpStatusError); ok && (hs.code == 403 || hs.code == 429) {
+					// след. порт по кругу
+					portIdx = (portIdx + 1) % len(s.ports)
+					port = s.ports[portIdx]
 					username = fmt.Sprintf("w%d_%d", id, time.Now().UnixNano())
 					client = httpClient(username, port)
+					lastRotate = time.Now()
+
+					if s.verbose {
+						s.log <- fmt.Sprintf("Worker %d: HTTP %d -> switch to port %d", id, hs.code, port)
+					}
+
 					if seg.length > s.minSegSize*2 {
 						shard := seg.length / 2
 						if shard < s.minSegSize {
@@ -1131,6 +1227,7 @@ func (s *State) worker(id int) {
 						}
 						left := &segment{start: seg.start, length: shard}
 						right := &segment{start: seg.start + shard, length: seg.length - shard}
+						// чуть быстрее перезапланируем
 						s.queue.pushDelayed(left, s.retryBase/2)
 						s.queue.pushDelayed(right, s.retryBase/2)
 						if s.verbose {
@@ -1138,10 +1235,15 @@ func (s *State) worker(id int) {
 						}
 						return
 					}
+					// небольшой бэкофф и вернуть сегмент как есть
+					seg.attempt++
+					s.queue.pushDelayed(seg, s.retryBase)
+					return
 				}
+
+				// общий бэкофф/сплит на иные ошибки — как и раньше
 				delay := s.backoffFor(seg.attempt, err)
 				seg.attempt++
-				// не ре-кьюим, если уже 100% или контекст отменён
 				if atomic.LoadInt64(&s.wroteBytes) >= s.totalSize || s.ctx.Err() != nil {
 					return
 				}

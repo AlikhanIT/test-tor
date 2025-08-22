@@ -27,6 +27,7 @@ import (
 	"io/fs"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -38,9 +39,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-)
 
-const torBlockDefault = 8192
+	"golang.org/x/net/proxy"
+)
 
 // ===== CLI flags =====
 var (
@@ -129,14 +130,32 @@ func (rl *rateLimiter) close() { close(rl.stop) }
 
 // ===== HTTP client factory (SOCKS5 over Tor) =====
 func httpClient(user string, port int) *http.Client {
-	proxyUrl, err := url.Parse(fmt.Sprintf("socks5://%s:%s@127.0.0.1:%d/", user, user, port))
-	if err != nil {
-		fmt.Fprintf(errorWriter, "ERROR - parse SOCKS5 URL '%s' port '%d': %v\n", user, port, err)
-		os.Exit(1)
+	auth := &proxy.Auth{User: user, Password: user}
+	socksAddr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	base := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
 	}
+
+	// Пытаемся с аутентификацией (для изоляции), при неудаче — без неё
+	socks5Dialer, err := proxy.SOCKS5("tcp", socksAddr, auth, base)
+	if err != nil {
+		socks5Dialer, err = proxy.SOCKS5("tcp", socksAddr, nil, base)
+		if err != nil {
+			fmt.Fprintf(errorWriter, "ERROR - SOCKS5 dialer to %s: %v\n", socksAddr, err)
+			os.Exit(1)
+		}
+	}
+
+	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return socks5Dialer.Dial(network, addr)
+	}
+
 	jar, _ := cookiejar.New(nil)
 	tr := &http.Transport{
-		Proxy:               http.ProxyURL(proxyUrl),
+		Proxy:               nil, // SOCKS5 используем через DialContext
+		DialContext:         dialContext,
 		MaxIdleConns:        256,
 		MaxIdleConnsPerHost: 128,
 		IdleConnTimeout:     45 * time.Second,
@@ -606,7 +625,8 @@ func (s *State) Fetch(src string) int {
 
 	s.startTime = time.Now()
 
-	if (!s.acceptRanges && s.totalSize < s.segSize*2) || s.circuits < 2 {
+	// Если сервер не поддерживает Range или мало воркеров — одиночный поток
+	if !s.acceptRanges || s.circuits < 2 {
 		fmt.Fprintln(messageWriter, "NOTE: single stream mode.")
 		code := s.singleStream()
 		if code == 0 {
@@ -697,6 +717,13 @@ func (s *State) singleStream() int {
 		fmt.Fprintf(errorWriter, "ERROR - copy: %v\n", err)
 		return 1
 	}
+
+	// гарантируем, что получили весь файл
+	if written < s.totalSize {
+		fmt.Fprintf(errorWriter, "ERROR - short read: got %d of %d bytes\n", written, s.totalSize)
+		return 1
+	}
+
 	s.addProgress(written)
 	return 0
 }
@@ -935,13 +962,6 @@ func (s *State) worker(id int) {
 				s.maybeFinish()
 			}()
 
-			// tail-mode: авто-скейл
-			remaining := s.totalSize - atomic.LoadInt64(&s.wroteBytes)
-			useTail := (remaining <= s.tailThreshold)
-			if useTail && s.tailWorkers < s.circuits {
-				s.tailWorkers = s.circuits
-			}
-
 			// ротация цепочки
 			if time.Since(lastRotate) >= s.minLifetime {
 				username = fmt.Sprintf("w%d_%d", id, time.Now().UnixNano())
@@ -1044,7 +1064,6 @@ func (s *State) fetchSegment(client *http.Client, seg *segment) error {
 		return err
 	}
 	if resp.Body == nil {
-		resp.Body.Close()
 		return fmt.Errorf("no body")
 	}
 	defer resp.Body.Close()
@@ -1081,6 +1100,19 @@ func (s *State) fetchSegment(client *http.Client, seg *segment) error {
 		}
 		return err
 	}
+
+	// короткое чтение без ошибки (ранний EOF) — дозагружаем остаток
+	if w < seg.length {
+		remain := seg.length - w
+		if w > 0 {
+			s.addProgress(w)
+		}
+		if remain > 0 {
+			s.queue.push(&segment{start: seg.start + w, length: remain, attempt: seg.attempt})
+		}
+		return nil
+	}
+
 	s.addProgress(w)
 	return nil
 }
